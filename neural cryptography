@@ -1,168 +1,1015 @@
-import tensorflow.compat.v1 as tf
-tf.disable_v2_behavior()
-import numpy as np
-
-%matplotlib inline
-import matplotlib.pyplot as plt
-
-# Importing Pandas as pd
-import pandas as pd
-learning_rate   = 0.0008
-batch_size      = 256
-sample_size     = 8192 # 4096 according to the paper
-epochs          = 500 # 850000 according to the paper
-steps_per_epoch = int(sample_size/batch_size)
-TEXT_SIZE = 128
-KEY_SIZE  = 128
-# Training parameters.
-ITERS_PER_ACTOR = 1
-EVE_MULTIPLIER = 2  # Train Eve 2x for every step of Alice/Bob
-# Set a random seed to help reproduce the output
-seed = 7919
-tf.set_random_seed(seed)
-np.random.seed(seed)
-
-# False if we want to train from scratch and true to contiune training a already trained model
-restore_trained_model = False
-def random_bools(sample_size, n):
-
-  temp =  np.random.random_integers(0, high=1, size=[sample_size, n])
-  temp = temp*2 - 1
-  return temp.astype(np.float32)
-def model(collection, message, key=None):
-
-  if key is not None:
-    combined_message = tf.concat(axis=1,
-      values=[message, key])
-  else:
-    combined_message = message
-
-  with tf.variable_scope(collection):
-    fc    = tf.layers.dense( combined_message, TEXT_SIZE + KEY_SIZE, activation=tf.nn.relu)
-    fc = tf.expand_dims(fc, 2)
-
-    # tf.contrib.layers.conv1d( input, filters, kernel_size, stride, padding, activation_fn)
-    conv1 = tf.layers.conv1d( fc, filters= 2, kernel_size= 4, strides= 1, padding='SAME',  activation=tf.nn.sigmoid)
-    conv2 = tf.layers.conv1d( conv1, filters= 4, kernel_size= 2, strides=2, padding='VALID', activation=tf.nn.sigmoid)
-    conv3 = tf.layers.conv1d( conv2, filters= 4, kernel_size= 1, strides=1, padding='SAME',  activation=tf.nn.sigmoid)
-
-    # output
-    conv4 = tf.layers.conv1d( conv3, filters= 1, kernel_size= 1, strides=1, padding='SAME',  activation=tf.nn.tanh)
-
-
-    out   = tf.squeeze(conv4, 2)
-  return out
-Alice_input_message  = tf.placeholder(tf.float32, shape=(batch_size, TEXT_SIZE), name='Alice_input_message')
-Alice_input_key      = tf.placeholder(tf.float32, shape=(batch_size, KEY_SIZE), name='Alice_input_key')
-
-
-
-Alice_out_cipher = model('Alice', Alice_input_message, Alice_input_key)
-Bob_out_message  = model('Bob', Alice_out_cipher, Alice_input_key)
-Eve_out_message  = model('Eve', Alice_out_cipher)
-
-
-## Eves LOSS
-Eves_loss = (1/batch_size)*tf.reduce_sum( tf.abs( Eve_out_message - Alice_input_message ))
-
-## ALICE AND BOB LOSS
-Bob_loss = (1/batch_size)*tf.reduce_sum( tf.abs( Bob_out_message  - Alice_input_message ))
-Eve_evadropping_loss = tf.reduce_sum( tf.square(float(TEXT_SIZE) / 2.0 - Eves_loss) / ((TEXT_SIZE / 2)**2) )
-
-Alice_bob_loss = Bob_loss + Eve_evadropping_loss
-# Get tensors to train
-Alice_vars =  tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES,scope='Alice')
-Bob_vars   =  tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES,scope='Bob')
-Eve_vars   =  tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='Eve')
-
-Eve_opt  = tf.train.AdamOptimizer(learning_rate=learning_rate, beta1=0.9, epsilon=1e-08).minimize(Eves_loss, var_list=[Eve_vars])
-bob_opt  = tf.train.AdamOptimizer(learning_rate=learning_rate, beta1=0.9, epsilon=1e-08).minimize(Alice_bob_loss, var_list=[Alice_vars + Bob_vars])
-
-
-sess = tf.Session()
-init = tf.global_variables_initializer()
-sess.run(init)
-
-alice_saver = tf.train.Saver(Alice_vars)
-bob_saver   = tf.train.Saver(Bob_vars)
-eve_saver   = tf.train.Saver(Eve_vars)
-
-
-if restore_trained_model:
-  alice_saver.restore(sess, "weights/alice_weights/model.ckpt")
-  bob_saver.restore(sess, "weights/bob_weights/model.ckpt")
-  eve_saver.restore(sess, "weights/eve_weights/model.ckpt")
-# DATASET
-messages = random_bools(sample_size, TEXT_SIZE)
-keys     = random_bools(sample_size, KEY_SIZE)
-# Training begins
-table = []
-temp_alice_bob_loss = 4
-i=0
-while i < epochs:
-
-
-  for j in range(steps_per_epoch): #steps per epoch = samplesize/BATCH_SIZE
-
-    # get batch dataset to train
-    batch_messages = messages[j*batch_size: (j+1)*batch_size]
-    batch_keys     = keys[j*batch_size: (j+1)*batch_size]
-
-    # Train Alice and Bob
-    for _ in range(ITERS_PER_ACTOR):
-      temp = sess.run([bob_opt, Bob_loss, Eve_evadropping_loss, Bob_out_message],
-                      feed_dict={Alice_input_message:batch_messages , Alice_input_key:batch_keys })
-
-      temp_alice_bob_loss = temp[1]
-      temp_eve_evs_loss   = temp[2]
-      temp_bob_msg        = temp[3]
-
-    # train Eve
-    for _ in range(ITERS_PER_ACTOR*EVE_MULTIPLIER):
-      temp = sess.run([Eve_opt, Eves_loss, Eve_out_message], feed_dict={Alice_input_message:batch_messages , Alice_input_key:batch_keys })
-
-      temp_eve_loss = temp[1]
-      temp_eve_msg  = temp[2]
-
-    table.append([i,temp_alice_bob_loss,temp_eve_loss,temp_alice_bob_loss + temp_eve_evs_loss])
-
-  # save after every 500 epochs
-  if i%500 == 0 and i!=0:
-    alice_saver.save(sess, "weights/alice_weights/model.ckpt")
-    bob_saver.save(sess, "weights/bob_weights/model.ckpt")
-    eve_saver.save(sess, "weights/eve_weights/model.ckpt")
-
-
-  # output bit error and loss after every 100 epochs
-  if i%1 == 0:
-    print('  epochs: ', i, '  bob bit error: ', temp_alice_bob_loss,' + ', temp_eve_evs_loss,'   & eve bit error:', temp_eve_loss)
-  i=i+1
-df = pd.DataFrame(table, columns=['Epoch Number', 'Bob Loss', 'Eve Loss','ABE loss'])
-print("Bob Loss Graph")
-plt.plot(df["Epoch Number"], df["Bob Loss"], label="Bob Loss")
-plt.xlabel('Epoch Number')
-plt.ylabel('Loss')
-plt.title('Bob Loss Graph')
-plt.legend()  # Add this line to display the legend
-
-# Show the plot
-plt.show()
-
-# Print Eve Loss Graph
-plt.plot(df["Epoch Number"], df["Eve Loss"], label="Eve Loss")
-plt.xlabel('Epoch Number')
-plt.ylabel('Loss')
-plt.title('Eve Loss Graph')
-plt.legend()  # Add this line to display the legend
-
-# Print Eve Loss Graph
-plt.plot(df["Epoch Number"], df["ABE loss"], label="ABE loss")
-plt.xlabel('Epoch Number')
-plt.ylabel('Loss')
-plt.title('ABE Loss Graph')
-plt.legend()  # Add this line to display the legend
-# Show the plot
-plt.show()
-
-plt.show()
-print(df)
+{
+  "cells": [
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "RtvQm0G3ssAh",
+        "outputId": "6f246d4e-f101-4151-f651-db38ce6c9c1c"
+      },
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "WARNING:tensorflow:From /usr/local/lib/python3.10/dist-packages/tensorflow/python/compat/v2_compat.py:108: disable_resource_variables (from tensorflow.python.ops.variable_scope) is deprecated and will be removed in a future version.\n",
+            "Instructions for updating:\n",
+            "non-resource variables are not supported in the long term\n"
+          ]
+        }
+      ],
+      "source": [
+        "import tensorflow.compat.v1 as tf\n",
+        "tf.disable_v2_behavior()\n",
+        "import numpy as np\n",
+        "\n",
+        "%matplotlib inline\n",
+        "import matplotlib.pyplot as plt\n",
+        "\n",
+        "# Importing Pandas as pd\n",
+        "import pandas as pd"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "XIicvhJ4svc3"
+      },
+      "outputs": [],
+      "source": [
+        "learning_rate   = 0.0008\n",
+        "batch_size      = 256\n",
+        "sample_size     = 8192 # 4096 according to the paper\n",
+        "epochs          = 500 # 850000 according to the paper\n",
+        "steps_per_epoch = int(sample_size/batch_size)"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "mUkVLSmysxvL"
+      },
+      "outputs": [],
+      "source": [
+        "TEXT_SIZE = 128\n",
+        "KEY_SIZE  = 128"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "bMpYDNcJs0UW"
+      },
+      "outputs": [],
+      "source": [
+        "# Training parameters.\n",
+        "ITERS_PER_ACTOR = 1\n",
+        "EVE_MULTIPLIER = 2  # Train Eve 2x for every step of Alice/Bob"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "If3joSGAs5pW"
+      },
+      "outputs": [],
+      "source": [
+        "# Set a random seed to help reproduce the output\n",
+        "seed = 7919\n",
+        "tf.set_random_seed(seed)\n",
+        "np.random.seed(seed)\n",
+        "\n",
+        "# False if we want to train from scratch and true to contiune training a already trained model\n",
+        "restore_trained_model = False\n"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "oyx53_g7s9ir"
+      },
+      "outputs": [],
+      "source": [
+        "\n",
+        "def random_bools(sample_size, n):\n",
+        "\n",
+        "  temp =  np.random.random_integers(0, high=1, size=[sample_size, n])\n",
+        "  temp = temp*2 - 1\n",
+        "  return temp.astype(np.float32)"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "RYNqte84tHDo"
+      },
+      "outputs": [],
+      "source": [
+        "def model(collection, message, key=None):\n",
+        "\n",
+        "  if key is not None:\n",
+        "    combined_message = tf.concat(axis=1,\n",
+        "      values=[message, key])\n",
+        "  else:\n",
+        "    combined_message = message\n",
+        "\n",
+        "  with tf.variable_scope(collection):\n",
+        "    fc    = tf.layers.dense( combined_message, TEXT_SIZE + KEY_SIZE, activation=tf.nn.relu)\n",
+        "    fc = tf.expand_dims(fc, 2)\n",
+        "\n",
+        "    # tf.contrib.layers.conv1d( input, filters, kernel_size, stride, padding, activation_fn)\n",
+        "    conv1 = tf.layers.conv1d( fc, filters= 2, kernel_size= 4, strides= 1, padding='SAME',  activation=tf.nn.sigmoid)\n",
+        "    conv2 = tf.layers.conv1d( conv1, filters= 4, kernel_size= 2, strides=2, padding='VALID', activation=tf.nn.sigmoid)\n",
+        "    conv3 = tf.layers.conv1d( conv2, filters= 4, kernel_size= 1, strides=1, padding='SAME',  activation=tf.nn.sigmoid)\n",
+        "\n",
+        "    # output\n",
+        "    conv4 = tf.layers.conv1d( conv3, filters= 1, kernel_size= 1, strides=1, padding='SAME',  activation=tf.nn.tanh)\n",
+        "\n",
+        "\n",
+        "    out   = tf.squeeze(conv4, 2)\n",
+        "  return out"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "XM2lIEk0tJb3",
+        "outputId": "d2a51e2b-0219-44b4-bbb4-5aae1d0a4ff5"
+      },
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "<ipython-input-7-2b8f4b2b92ca>:10: UserWarning: `tf.layers.dense` is deprecated and will be removed in a future version. Please use `tf.keras.layers.Dense` instead.\n",
+            "  fc    = tf.layers.dense( combined_message, TEXT_SIZE + KEY_SIZE, activation=tf.nn.relu)\n",
+            "<ipython-input-7-2b8f4b2b92ca>:14: UserWarning: `tf.layers.conv1d` is deprecated and will be removed in a future version. Please Use `tf.keras.layers.Conv1D` instead.\n",
+            "  conv1 = tf.layers.conv1d( fc, filters= 2, kernel_size= 4, strides= 1, padding='SAME',  activation=tf.nn.sigmoid)\n",
+            "<ipython-input-7-2b8f4b2b92ca>:15: UserWarning: `tf.layers.conv1d` is deprecated and will be removed in a future version. Please Use `tf.keras.layers.Conv1D` instead.\n",
+            "  conv2 = tf.layers.conv1d( conv1, filters= 4, kernel_size= 2, strides=2, padding='VALID', activation=tf.nn.sigmoid)\n",
+            "<ipython-input-7-2b8f4b2b92ca>:16: UserWarning: `tf.layers.conv1d` is deprecated and will be removed in a future version. Please Use `tf.keras.layers.Conv1D` instead.\n",
+            "  conv3 = tf.layers.conv1d( conv2, filters= 4, kernel_size= 1, strides=1, padding='SAME',  activation=tf.nn.sigmoid)\n",
+            "<ipython-input-7-2b8f4b2b92ca>:19: UserWarning: `tf.layers.conv1d` is deprecated and will be removed in a future version. Please Use `tf.keras.layers.Conv1D` instead.\n",
+            "  conv4 = tf.layers.conv1d( conv3, filters= 1, kernel_size= 1, strides=1, padding='SAME',  activation=tf.nn.tanh)\n"
+          ]
+        }
+      ],
+      "source": [
+        "Alice_input_message  = tf.placeholder(tf.float32, shape=(batch_size, TEXT_SIZE), name='Alice_input_message')\n",
+        "Alice_input_key      = tf.placeholder(tf.float32, shape=(batch_size, KEY_SIZE), name='Alice_input_key')\n",
+        "\n",
+        "\n",
+        "\n",
+        "Alice_out_cipher = model('Alice', Alice_input_message, Alice_input_key)\n",
+        "Bob_out_message  = model('Bob', Alice_out_cipher, Alice_input_key)\n",
+        "Eve_out_message  = model('Eve', Alice_out_cipher)\n",
+        "\n",
+        "\n",
+        "## Eves LOSS\n",
+        "Eves_loss = (1/batch_size)*tf.reduce_sum( tf.abs( Eve_out_message - Alice_input_message ))\n",
+        "\n",
+        "## ALICE AND BOB LOSS\n",
+        "Bob_loss = (1/batch_size)*tf.reduce_sum( tf.abs( Bob_out_message  - Alice_input_message ))\n",
+        "Eve_evadropping_loss = tf.reduce_sum( tf.square(float(TEXT_SIZE) / 2.0 - Eves_loss) / ((TEXT_SIZE / 2)**2) )\n",
+        "\n",
+        "Alice_bob_loss = Bob_loss + Eve_evadropping_loss\n"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "qkVY5pYwtRXZ"
+      },
+      "outputs": [],
+      "source": [
+        "# Get tensors to train\n",
+        "Alice_vars =  tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES,scope='Alice')\n",
+        "Bob_vars   =  tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES,scope='Bob')\n",
+        "Eve_vars   =  tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='Eve')\n",
+        "\n",
+        "Eve_opt  = tf.train.AdamOptimizer(learning_rate=learning_rate, beta1=0.9, epsilon=1e-08).minimize(Eves_loss, var_list=[Eve_vars])\n",
+        "bob_opt  = tf.train.AdamOptimizer(learning_rate=learning_rate, beta1=0.9, epsilon=1e-08).minimize(Alice_bob_loss, var_list=[Alice_vars + Bob_vars])\n",
+        "\n",
+        "\n",
+        "sess = tf.Session()\n",
+        "init = tf.global_variables_initializer()\n",
+        "sess.run(init)\n",
+        "\n",
+        "alice_saver = tf.train.Saver(Alice_vars)\n",
+        "bob_saver   = tf.train.Saver(Bob_vars)\n",
+        "eve_saver   = tf.train.Saver(Eve_vars)\n",
+        "\n",
+        "\n",
+        "if restore_trained_model:\n",
+        "  alice_saver.restore(sess, \"weights/alice_weights/model.ckpt\")\n",
+        "  bob_saver.restore(sess, \"weights/bob_weights/model.ckpt\")\n",
+        "  eve_saver.restore(sess, \"weights/eve_weights/model.ckpt\")\n"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "x3w6D9bltWtH",
+        "outputId": "5bde82af-1402-48b7-d0d4-dc4aaa646901"
+      },
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "<ipython-input-6-ad4b240f7772>:3: DeprecationWarning: This function is deprecated. Please call randint(0, 1 + 1) instead\n",
+            "  temp =  np.random.random_integers(0, high=1, size=[sample_size, n])\n"
+          ]
+        }
+      ],
+      "source": [
+        "# DATASET\n",
+        "messages = random_bools(sample_size, TEXT_SIZE)\n",
+        "keys     = random_bools(sample_size, KEY_SIZE)"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "lb9pgUTvtYkI",
+        "outputId": "e05d29cd-235b-45d8-f127-d00cf0c7318c"
+      },
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "  epochs:  0   bob bit error:  63.933887  +  1.0023321    & eve bit error: 64.037315\n",
+            "  epochs:  1   bob bit error:  63.934082  +  1.0024725    & eve bit error: 64.03954\n",
+            "  epochs:  2   bob bit error:  63.93419  +  1.00259    & eve bit error: 64.041405\n",
+            "  epochs:  3   bob bit error:  63.933975  +  1.0026854    & eve bit error: 64.04293\n",
+            "  epochs:  4   bob bit error:  63.933132  +  1.0027637    & eve bit error: 64.044174\n",
+            "  epochs:  5   bob bit error:  63.931  +  1.0028349    & eve bit error: 64.0453\n",
+            "  epochs:  6   bob bit error:  63.92573  +  1.0028893    & eve bit error: 64.046165\n",
+            "  epochs:  7   bob bit error:  63.911232  +  1.0028014    & eve bit error: 64.04466\n",
+            "  epochs:  8   bob bit error:  63.863346  +  1.0019355    & eve bit error: 64.03023\n",
+            "  epochs:  9   bob bit error:  63.667458  +  0.9953986    & eve bit error: 63.92121\n",
+            "  epochs:  10   bob bit error:  62.901062  +  0.9276773    & eve bit error: 62.76942\n",
+            "  epochs:  11   bob bit error:  60.96454  +  0.563441    & eve bit error: 55.830948\n",
+            "  epochs:  12   bob bit error:  57.691498  +  0.1371986    & eve bit error: 43.607204\n",
+            "  epochs:  13   bob bit error:  53.272835  +  0.0001444716    & eve bit error: 32.18674\n",
+            "  epochs:  14   bob bit error:  48.034412  +  0.0510711    & eve bit error: 24.619345\n",
+            "  epochs:  15   bob bit error:  42.230556  +  0.14668207    & eve bit error: 19.627594\n",
+            "  epochs:  16   bob bit error:  36.30358  +  0.24670857    & eve bit error: 16.005861\n",
+            "  epochs:  17   bob bit error:  30.71165  +  0.34332973    & eve bit error: 13.159453\n",
+            "  epochs:  18   bob bit error:  25.678717  +  0.43521452    & eve bit error: 10.805891\n",
+            "  epochs:  19   bob bit error:  21.28267  +  0.5230324    & eve bit error: 8.783348\n",
+            "  epochs:  20   bob bit error:  17.565666  +  0.59958714    & eve bit error: 7.1625357\n",
+            "  epochs:  21   bob bit error:  14.4908  +  0.6679954    & eve bit error: 5.79563\n",
+            "  epochs:  22   bob bit error:  11.996887  +  0.7254181    & eve bit error: 4.705039\n",
+            "  epochs:  23   bob bit error:  10.013733  +  0.77213174    & eve bit error: 3.8496199\n",
+            "  epochs:  24   bob bit error:  8.463595  +  0.8060053    & eve bit error: 3.2484374\n",
+            "  epochs:  25   bob bit error:  7.24926  +  0.8304603    & eve bit error: 2.8191886\n",
+            "  epochs:  26   bob bit error:  6.2794685  +  0.84992737    & eve bit error: 2.4840343\n",
+            "  epochs:  27   bob bit error:  5.4965024  +  0.8657061    & eve bit error: 2.2135987\n",
+            "  epochs:  28   bob bit error:  4.8588567  +  0.87914366    & eve bit error: 1.9843802\n",
+            "  epochs:  29   bob bit error:  4.3394856  +  0.8902101    & eve bit error: 1.796196\n",
+            "  epochs:  30   bob bit error:  3.9059525  +  0.8994624    & eve bit error: 1.64159\n",
+            "  epochs:  31   bob bit error:  3.5332234  +  0.9078151    & eve bit error: 1.5031886\n",
+            "  epochs:  32   bob bit error:  3.2146592  +  0.9145443    & eve bit error: 1.390182\n",
+            "  epochs:  33   bob bit error:  2.9417028  +  0.920593    & eve bit error: 1.2897984\n",
+            "  epochs:  34   bob bit error:  2.7022915  +  0.9258906    & eve bit error: 1.2025397\n",
+            "  epochs:  35   bob bit error:  2.4919472  +  0.9302189    & eve bit error: 1.1308064\n",
+            "  epochs:  36   bob bit error:  2.3078697  +  0.9339266    & eve bit error: 1.0696678\n",
+            "  epochs:  37   bob bit error:  2.1451578  +  0.93696815    & eve bit error: 1.0192841\n",
+            "  epochs:  38   bob bit error:  1.998963  +  0.93948025    & eve bit error: 0.97785157\n",
+            "  epochs:  39   bob bit error:  1.8686919  +  0.9417652    & eve bit error: 0.94121134\n",
+            "  epochs:  40   bob bit error:  1.7518194  +  0.9434997    & eve bit error: 0.91305363\n",
+            "  epochs:  41   bob bit error:  1.6469333  +  0.9447016    & eve bit error: 0.8937514\n",
+            "  epochs:  42   bob bit error:  1.5520692  +  0.94549143    & eve bit error: 0.88102436\n",
+            "  epochs:  43   bob bit error:  1.4666011  +  0.94586676    & eve bit error: 0.874757\n",
+            "  epochs:  44   bob bit error:  1.388992  +  0.94575757    & eve bit error: 0.8764736\n",
+            "  epochs:  45   bob bit error:  1.3164134  +  0.9452757    & eve bit error: 0.884779\n",
+            "  epochs:  46   bob bit error:  1.2509019  +  0.9448066    & eve bit error: 0.89263\n",
+            "  epochs:  47   bob bit error:  1.1918573  +  0.9435943    & eve bit error: 0.9132112\n",
+            "  epochs:  48   bob bit error:  1.1372079  +  0.94237137    & eve bit error: 0.9334936\n",
+            "  epochs:  49   bob bit error:  1.0865855  +  0.94049317    & eve bit error: 0.964699\n",
+            "  epochs:  50   bob bit error:  1.0391567  +  0.93867916    & eve bit error: 0.9945864\n",
+            "  epochs:  51   bob bit error:  0.99575484  +  0.9367663    & eve bit error: 1.026447\n",
+            "  epochs:  52   bob bit error:  0.9545126  +  0.93399996    & eve bit error: 1.072439\n",
+            "  epochs:  53   bob bit error:  0.91636217  +  0.9306666    & eve bit error: 1.1287174\n",
+            "  epochs:  54   bob bit error:  0.88074785  +  0.92693084    & eve bit error: 1.1909614\n",
+            "  epochs:  55   bob bit error:  0.84810525  +  0.9215903    & eve bit error: 1.2848167\n",
+            "  epochs:  56   bob bit error:  0.81711864  +  0.9166932    & eve bit error: 1.3699887\n",
+            "  epochs:  57   bob bit error:  0.78709716  +  0.91103727    & eve bit error: 1.4695258\n",
+            "  epochs:  58   bob bit error:  0.7604351  +  0.9069052    & eve bit error: 1.533773\n",
+            "  epochs:  59   bob bit error:  0.73894763  +  0.90016246    & eve bit error: 1.6327391\n",
+            "  epochs:  60   bob bit error:  0.71060455  +  0.8932113    & eve bit error: 1.7720476\n",
+            "  epochs:  61   bob bit error:  0.6849047  +  0.8869154    & eve bit error: 1.8790992\n",
+            "  epochs:  62   bob bit error:  0.6635345  +  0.8819702    & eve bit error: 1.9542058\n",
+            "  epochs:  63   bob bit error:  0.6442504  +  0.8716321    & eve bit error: 2.1325645\n",
+            "  epochs:  64   bob bit error:  0.6250329  +  0.86165285    & eve bit error: 2.3047042\n",
+            "  epochs:  65   bob bit error:  0.60606277  +  0.8540197    & eve bit error: 2.437614\n",
+            "  epochs:  66   bob bit error:  0.58950925  +  0.84528446    & eve bit error: 2.597765\n",
+            "  epochs:  67   bob bit error:  0.57193404  +  0.8364018    & eve bit error: 2.7469988\n",
+            "  epochs:  68   bob bit error:  0.55732536  +  0.8242298    & eve bit error: 2.9684522\n",
+            "  epochs:  69   bob bit error:  0.54172933  +  0.8127207    & eve bit error: 3.1675444\n",
+            "  epochs:  70   bob bit error:  0.5283094  +  0.7962761    & eve bit error: 3.4619966\n",
+            "  epochs:  71   bob bit error:  0.5046317  +  0.7823926    & eve bit error: 3.7221456\n",
+            "  epochs:  72   bob bit error:  0.48489118  +  0.7678403    & eve bit error: 3.9790297\n",
+            "  epochs:  73   bob bit error:  0.47790563  +  0.7486105    & eve bit error: 4.324644\n",
+            "  epochs:  74   bob bit error:  0.4590114  +  0.7394154    & eve bit error: 4.51693\n",
+            "  epochs:  75   bob bit error:  0.46050268  +  0.71024877    & eve bit error: 5.042069\n",
+            "  epochs:  76   bob bit error:  0.43495783  +  0.70607275    & eve bit error: 5.1774616\n",
+            "  epochs:  77   bob bit error:  0.45936552  +  0.6796011    & eve bit error: 5.624453\n",
+            "  epochs:  78   bob bit error:  0.4234522  +  0.66759783    & eve bit error: 5.8633127\n",
+            "  epochs:  79   bob bit error:  0.40827936  +  0.64334846    & eve bit error: 6.3856564\n",
+            "  epochs:  80   bob bit error:  0.39783084  +  0.62461865    & eve bit error: 6.7475305\n",
+            "  epochs:  81   bob bit error:  0.39648703  +  0.5978781    & eve bit error: 7.280328\n",
+            "  epochs:  82   bob bit error:  0.38287282  +  0.572934    & eve bit error: 7.81683\n",
+            "  epochs:  83   bob bit error:  0.37964392  +  0.546223    & eve bit error: 8.393145\n",
+            "  epochs:  84   bob bit error:  0.37475756  +  0.5202352    & eve bit error: 8.950045\n",
+            "  epochs:  85   bob bit error:  0.36480966  +  0.4965554    & eve bit error: 9.490179\n",
+            "  epochs:  86   bob bit error:  0.3597822  +  0.46943235    & eve bit error: 10.136122\n",
+            "  epochs:  87   bob bit error:  0.3634128  +  0.4454597    & eve bit error: 10.660057\n",
+            "  epochs:  88   bob bit error:  0.36638665  +  0.421592    & eve bit error: 11.247372\n",
+            "  epochs:  89   bob bit error:  0.34436822  +  0.4067588    & eve bit error: 11.655713\n",
+            "  epochs:  90   bob bit error:  0.35361695  +  0.3967651    & eve bit error: 11.89372\n",
+            "  epochs:  91   bob bit error:  0.44234535  +  0.37984508    & eve bit error: 12.275246\n",
+            "  epochs:  92   bob bit error:  0.3708192  +  0.3863699    & eve bit error: 12.125908\n",
+            "  epochs:  93   bob bit error:  0.3143261  +  0.37929454    & eve bit error: 12.321459\n",
+            "  epochs:  94   bob bit error:  0.29507667  +  0.35890552    & eve bit error: 12.865601\n",
+            "  epochs:  95   bob bit error:  0.2877719  +  0.33250546    & eve bit error: 13.586747\n",
+            "  epochs:  96   bob bit error:  0.28578314  +  0.30909947    & eve bit error: 14.244235\n",
+            "  epochs:  97   bob bit error:  0.28337103  +  0.28695995    & eve bit error: 14.893761\n",
+            "  epochs:  98   bob bit error:  0.28023112  +  0.2667336    & eve bit error: 15.506166\n",
+            "  epochs:  99   bob bit error:  0.27720332  +  0.25069386    & eve bit error: 16.007044\n",
+            "  epochs:  100   bob bit error:  0.27312547  +  0.23661233    & eve bit error: 16.463812\n",
+            "  epochs:  101   bob bit error:  0.26957202  +  0.22223562    & eve bit error: 16.940262\n",
+            "  epochs:  102   bob bit error:  0.26475987  +  0.2116319    & eve bit error: 17.301765\n",
+            "  epochs:  103   bob bit error:  0.25994664  +  0.20149653    & eve bit error: 17.656715\n",
+            "  epochs:  104   bob bit error:  0.25534832  +  0.1912161    & eve bit error: 18.029629\n",
+            "  epochs:  105   bob bit error:  0.24991447  +  0.18194503    & eve bit error: 18.378813\n",
+            "  epochs:  106   bob bit error:  0.2459985  +  0.1715459    & eve bit error: 18.772455\n",
+            "  epochs:  107   bob bit error:  0.24057005  +  0.16228162    & eve bit error: 19.135983\n",
+            "  epochs:  108   bob bit error:  0.23419309  +  0.15571521    & eve bit error: 19.396603\n",
+            "  epochs:  109   bob bit error:  0.22994268  +  0.14825262    & eve bit error: 19.701595\n",
+            "  epochs:  110   bob bit error:  0.22499889  +  0.1399862    & eve bit error: 20.049229\n",
+            "  epochs:  111   bob bit error:  0.21971312  +  0.13277705    & eve bit error: 20.353561\n",
+            "  epochs:  112   bob bit error:  0.21566838  +  0.12551947    & eve bit error: 20.689281\n",
+            "  epochs:  113   bob bit error:  0.21102849  +  0.119812176    & eve bit error: 20.945982\n",
+            "  epochs:  114   bob bit error:  0.20444731  +  0.11515947    & eve bit error: 21.156715\n",
+            "  epochs:  115   bob bit error:  0.20018008  +  0.109865375    & eve bit error: 21.415028\n",
+            "  epochs:  116   bob bit error:  0.2020831  +  0.100062266    & eve bit error: 21.87157\n",
+            "  epochs:  117   bob bit error:  0.18989025  +  0.09644233    & eve bit error: 22.121365\n",
+            "  epochs:  118   bob bit error:  0.18986598  +  0.09409801    & eve bit error: 22.204077\n",
+            "  epochs:  119   bob bit error:  0.18374416  +  0.09080259    & eve bit error: 22.332966\n",
+            "  epochs:  120   bob bit error:  0.19655071  +  0.082855165    & eve bit error: 22.714027\n",
+            "  epochs:  121   bob bit error:  0.17443264  +  0.080452    & eve bit error: 23.011002\n",
+            "  epochs:  122   bob bit error:  0.1731767  +  0.08367233    & eve bit error: 22.78397\n",
+            "  epochs:  123   bob bit error:  0.17259352  +  0.08023575    & eve bit error: 22.951172\n",
+            "  epochs:  124   bob bit error:  0.17354812  +  0.08027769    & eve bit error: 22.922905\n",
+            "  epochs:  125   bob bit error:  0.17146458  +  0.07703968    & eve bit error: 23.14243\n",
+            "  epochs:  126   bob bit error:  0.15912268  +  0.07625914    & eve bit error: 23.177414\n",
+            "  epochs:  127   bob bit error:  0.14841829  +  0.071262754    & eve bit error: 23.484367\n",
+            "  epochs:  128   bob bit error:  0.140831  +  0.06512033    & eve bit error: 23.858822\n",
+            "  epochs:  129   bob bit error:  0.13797769  +  0.058983278    & eve bit error: 24.248154\n",
+            "  epochs:  130   bob bit error:  0.13619417  +  0.053408295    & eve bit error: 24.624199\n",
+            "  epochs:  131   bob bit error:  0.134354  +  0.049465846    & eve bit error: 24.898474\n",
+            "  epochs:  132   bob bit error:  0.13223045  +  0.045534577    & eve bit error: 25.188622\n",
+            "  epochs:  133   bob bit error:  0.13012972  +  0.042375892    & eve bit error: 25.423178\n",
+            "  epochs:  134   bob bit error:  0.12781304  +  0.03851573    & eve bit error: 25.730232\n",
+            "  epochs:  135   bob bit error:  0.12555884  +  0.03553694    & eve bit error: 25.978374\n",
+            "  epochs:  136   bob bit error:  0.12308891  +  0.033187766    & eve bit error: 26.179195\n",
+            "  epochs:  137   bob bit error:  0.120441616  +  0.031011887    & eve bit error: 26.373955\n",
+            "  epochs:  138   bob bit error:  0.11764875  +  0.028538028    & eve bit error: 26.599882\n",
+            "  epochs:  139   bob bit error:  0.115024395  +  0.026755003    & eve bit error: 26.772015\n",
+            "  epochs:  140   bob bit error:  0.11265631  +  0.025092995    & eve bit error: 26.935963\n",
+            "  epochs:  141   bob bit error:  0.11012481  +  0.023046654    & eve bit error: 27.15123\n",
+            "  epochs:  142   bob bit error:  0.10771315  +  0.021634964    & eve bit error: 27.308216\n",
+            "  epochs:  143   bob bit error:  0.10555671  +  0.020380292    & eve bit error: 27.444294\n",
+            "  epochs:  144   bob bit error:  0.103072196  +  0.01887975    & eve bit error: 27.611807\n",
+            "  epochs:  145   bob bit error:  0.10121757  +  0.01771278    & eve bit error: 27.75631\n",
+            "  epochs:  146   bob bit error:  0.09878697  +  0.016324276    & eve bit error: 27.91324\n",
+            "  epochs:  147   bob bit error:  0.09660222  +  0.015386012    & eve bit error: 28.029406\n",
+            "  epochs:  148   bob bit error:  0.0959929  +  0.013770402    & eve bit error: 28.23784\n",
+            "  epochs:  149   bob bit error:  0.09245826  +  0.0129921865    & eve bit error: 28.354279\n",
+            "  epochs:  150   bob bit error:  0.090313055  +  0.012210074    & eve bit error: 28.474104\n",
+            "  epochs:  151   bob bit error:  0.08831145  +  0.011476312    & eve bit error: 28.56703\n",
+            "  epochs:  152   bob bit error:  0.08641595  +  0.010495798    & eve bit error: 28.694927\n",
+            "  epochs:  153   bob bit error:  0.08481569  +  0.008619025    & eve bit error: 28.97314\n",
+            "  epochs:  154   bob bit error:  0.082682855  +  0.007644693    & eve bit error: 29.16327\n",
+            "  epochs:  155   bob bit error:  0.08073008  +  0.007581764    & eve bit error: 29.201998\n",
+            "  epochs:  156   bob bit error:  0.0788278  +  0.0075787646    & eve bit error: 29.216743\n",
+            "  epochs:  157   bob bit error:  0.07726917  +  0.007351874    & eve bit error: 29.25111\n",
+            "  epochs:  158   bob bit error:  0.07593886  +  0.006781967    & eve bit error: 29.342638\n",
+            "  epochs:  159   bob bit error:  0.074261665  +  0.0057707066    & eve bit error: 29.545174\n",
+            "  epochs:  160   bob bit error:  0.07253568  +  0.005173169    & eve bit error: 29.69117\n",
+            "  epochs:  161   bob bit error:  0.07096577  +  0.00491947    & eve bit error: 29.753492\n",
+            "  epochs:  162   bob bit error:  0.06955718  +  0.004394209    & eve bit error: 29.8663\n",
+            "  epochs:  163   bob bit error:  0.06824695  +  0.0042273477    & eve bit error: 29.904148\n",
+            "  epochs:  164   bob bit error:  0.06681689  +  0.0037716066    & eve bit error: 30.017504\n",
+            "  epochs:  165   bob bit error:  0.065464824  +  0.0033336843    & eve bit error: 30.134834\n",
+            "  epochs:  166   bob bit error:  0.0640575  +  0.0032236956    & eve bit error: 30.17915\n",
+            "  epochs:  167   bob bit error:  0.062906176  +  0.0026889995    & eve bit error: 30.32288\n",
+            "  epochs:  168   bob bit error:  0.061683983  +  0.00241857    & eve bit error: 30.3872\n",
+            "  epochs:  169   bob bit error:  0.060364265  +  0.0018394355    & eve bit error: 30.587498\n",
+            "  epochs:  170   bob bit error:  0.058819488  +  0.0015550369    & eve bit error: 30.719738\n",
+            "  epochs:  171   bob bit error:  0.05749309  +  0.0019401065    & eve bit error: 30.58938\n",
+            "  epochs:  172   bob bit error:  0.0565134  +  0.00202929    & eve bit error: 30.537224\n",
+            "  epochs:  173   bob bit error:  0.055462558  +  0.0018969931    & eve bit error: 30.565945\n",
+            "  epochs:  174   bob bit error:  0.05416738  +  0.0015033548    & eve bit error: 30.72562\n",
+            "  epochs:  175   bob bit error:  0.05289225  +  0.0013560588    & eve bit error: 30.807076\n",
+            "  epochs:  176   bob bit error:  0.05209598  +  0.0014344295    & eve bit error: 30.768566\n",
+            "  epochs:  177   bob bit error:  0.05126883  +  0.0012595342    & eve bit error: 30.828075\n",
+            "  epochs:  178   bob bit error:  0.05001101  +  0.0010631282    & eve bit error: 30.92353\n",
+            "  epochs:  179   bob bit error:  0.048821248  +  0.0010221777    & eve bit error: 30.964947\n",
+            "  epochs:  180   bob bit error:  0.04805977  +  0.0010131004    & eve bit error: 30.965721\n",
+            "  epochs:  181   bob bit error:  0.04722327  +  0.0010161989    & eve bit error: 30.951202\n",
+            "  epochs:  182   bob bit error:  0.04611651  +  0.0010167918    & eve bit error: 30.9538\n",
+            "  epochs:  183   bob bit error:  0.045164816  +  0.0008332696    & eve bit error: 31.061348\n",
+            "  epochs:  184   bob bit error:  0.044569556  +  0.000844387    & eve bit error: 31.045454\n",
+            "  epochs:  185   bob bit error:  0.04381253  +  0.0005590007    & eve bit error: 31.208668\n",
+            "  epochs:  186   bob bit error:  0.042703327  +  0.0004981625    & eve bit error: 31.254816\n",
+            "  epochs:  187   bob bit error:  0.041826505  +  0.00048291287    & eve bit error: 31.27803\n",
+            "  epochs:  188   bob bit error:  0.041135438  +  0.0004963098    & eve bit error: 31.264359\n",
+            "  epochs:  189   bob bit error:  0.040320992  +  0.00041612788    & eve bit error: 31.318054\n",
+            "  epochs:  190   bob bit error:  0.039431185  +  0.00037490908    & eve bit error: 31.349712\n",
+            "  epochs:  191   bob bit error:  0.038791373  +  0.00044533765    & eve bit error: 31.296247\n",
+            "  epochs:  192   bob bit error:  0.038290396  +  0.00037722083    & eve bit error: 31.354553\n",
+            "  epochs:  193   bob bit error:  0.03749091  +  0.00035323462    & eve bit error: 31.366032\n",
+            "  epochs:  194   bob bit error:  0.036624216  +  0.00030238353    & eve bit error: 31.408665\n",
+            "  epochs:  195   bob bit error:  0.03600622  +  0.00027701087    & eve bit error: 31.442806\n",
+            "  epochs:  196   bob bit error:  0.03540545  +  0.0002878831    & eve bit error: 31.434937\n",
+            "  epochs:  197   bob bit error:  0.034650907  +  0.000256734    & eve bit error: 31.46537\n",
+            "  epochs:  198   bob bit error:  0.034021232  +  0.00022634985    & eve bit error: 31.484825\n",
+            "  epochs:  199   bob bit error:  0.033489786  +  0.0001930869    & eve bit error: 31.520298\n",
+            "  epochs:  200   bob bit error:  0.032852933  +  0.00020554796    & eve bit error: 31.517572\n",
+            "  epochs:  201   bob bit error:  0.032230288  +  0.00013366032    & eve bit error: 31.598694\n",
+            "  epochs:  202   bob bit error:  0.031667672  +  0.00012247261    & eve bit error: 31.613556\n",
+            "  epochs:  203   bob bit error:  0.031124959  +  0.00016134353    & eve bit error: 31.569935\n",
+            "  epochs:  204   bob bit error:  0.030589163  +  0.00014578708    & eve bit error: 31.588749\n",
+            "  epochs:  205   bob bit error:  0.030052343  +  0.00017923636    & eve bit error: 31.550474\n",
+            "  epochs:  206   bob bit error:  0.029532805  +  0.00012060774    & eve bit error: 31.625147\n",
+            "  epochs:  207   bob bit error:  0.02902028  +  8.948093e-05    & eve bit error: 31.669926\n",
+            "  epochs:  208   bob bit error:  0.02849859  +  0.00012920379    & eve bit error: 31.611473\n",
+            "  epochs:  209   bob bit error:  0.027997216  +  0.00012170865    & eve bit error: 31.625\n",
+            "  epochs:  210   bob bit error:  0.027510483  +  8.125776e-05    & eve bit error: 31.680725\n",
+            "  epochs:  211   bob bit error:  0.027028535  +  0.00011519491    & eve bit error: 31.626846\n",
+            "  epochs:  212   bob bit error:  0.026557893  +  0.000129707    & eve bit error: 31.604065\n",
+            "  epochs:  213   bob bit error:  0.026090844  +  7.8191355e-05    & eve bit error: 31.683205\n",
+            "  epochs:  214   bob bit error:  0.025642257  +  6.742275e-05    & eve bit error: 31.709167\n",
+            "  epochs:  215   bob bit error:  0.025201917  +  7.34564e-05    & eve bit error: 31.696953\n",
+            "  epochs:  216   bob bit error:  0.02476175  +  7.94646e-05    & eve bit error: 31.685768\n",
+            "  epochs:  217   bob bit error:  0.024343468  +  5.6567736e-05    & eve bit error: 31.727219\n",
+            "  epochs:  218   bob bit error:  0.023933657  +  5.225112e-05    & eve bit error: 31.740112\n",
+            "  epochs:  219   bob bit error:  0.023521112  +  5.9564256e-05    & eve bit error: 31.72744\n",
+            "  epochs:  220   bob bit error:  0.023126267  +  4.897037e-05    & eve bit error: 31.750944\n",
+            "  epochs:  221   bob bit error:  0.022737345  +  4.0096238e-05    & eve bit error: 31.76909\n",
+            "  epochs:  222   bob bit error:  0.022347283  +  2.6296651e-05    & eve bit error: 31.80361\n",
+            "  epochs:  223   bob bit error:  0.021982737  +  2.9940875e-05    & eve bit error: 31.786509\n",
+            "  epochs:  224   bob bit error:  0.021602213  +  1.5352998e-05    & eve bit error: 31.837837\n",
+            "  epochs:  225   bob bit error:  0.021241691  +  4.00902e-05    & eve bit error: 31.764158\n",
+            "  epochs:  226   bob bit error:  0.02089739  +  1.392935e-05    & eve bit error: 31.8391\n",
+            "  epochs:  227   bob bit error:  0.020536538  +  3.1445234e-05    & eve bit error: 31.790379\n",
+            "  epochs:  228   bob bit error:  0.020206083  +  3.590401e-05    & eve bit error: 31.766695\n",
+            "  epochs:  229   bob bit error:  0.019864086  +  2.3616547e-05    & eve bit error: 31.809387\n",
+            "  epochs:  230   bob bit error:  0.019538313  +  3.789007e-05    & eve bit error: 31.771229\n",
+            "  epochs:  231   bob bit error:  0.01921538  +  2.7432861e-05    & eve bit error: 31.796139\n",
+            "  epochs:  232   bob bit error:  0.018894434  +  7.0473296e-05    & eve bit error: 31.70414\n",
+            "  epochs:  233   bob bit error:  0.018590873  +  3.6413672e-05    & eve bit error: 31.77499\n",
+            "  epochs:  234   bob bit error:  0.018272787  +  4.881533e-05    & eve bit error: 31.75029\n",
+            "  epochs:  235   bob bit error:  0.017982963  +  1.9189514e-05    & eve bit error: 31.821178\n",
+            "  epochs:  236   bob bit error:  0.017687157  +  2.8521117e-05    & eve bit error: 31.794561\n",
+            "  epochs:  237   bob bit error:  0.017397735  +  3.2188917e-05    & eve bit error: 31.78877\n",
+            "  epochs:  238   bob bit error:  0.017110648  +  2.0771804e-05    & eve bit error: 31.825003\n",
+            "  epochs:  239   bob bit error:  0.016828788  +  3.4822962e-05    & eve bit error: 31.786095\n",
+            "  epochs:  240   bob bit error:  0.016564237  +  1.9060226e-05    & eve bit error: 31.818989\n",
+            "  epochs:  241   bob bit error:  0.016291223  +  1.94226e-05    & eve bit error: 31.808338\n",
+            "  epochs:  242   bob bit error:  0.016029797  +  1.3113099e-06    & eve bit error: 31.908932\n",
+            "  epochs:  243   bob bit error:  0.015766658  +  2.2773762e-05    & eve bit error: 31.81343\n",
+            "  epochs:  244   bob bit error:  0.015517546  +  2.046543e-05    & eve bit error: 31.816343\n",
+            "  epochs:  245   bob bit error:  0.015260345  +  1.9207795e-05    & eve bit error: 31.821379\n",
+            "  epochs:  246   bob bit error:  0.01502135  +  7.125983e-06    & eve bit error: 31.87005\n",
+            "  epochs:  247   bob bit error:  0.014779126  +  2.8996815e-06    & eve bit error: 31.885872\n",
+            "  epochs:  248   bob bit error:  0.014538964  +  2.123234e-05    & eve bit error: 31.797573\n",
+            "  epochs:  249   bob bit error:  0.014311543  +  3.0084734e-06    & eve bit error: 31.890793\n",
+            "  epochs:  250   bob bit error:  0.01407708  +  2.8713068e-05    & eve bit error: 31.794971\n",
+            "  epochs:  251   bob bit error:  0.013856396  +  7.1228005e-06    & eve bit error: 31.863707\n",
+            "  epochs:  252   bob bit error:  0.013634682  +  1.873066e-05    & eve bit error: 31.826239\n",
+            "  epochs:  253   bob bit error:  0.013422977  +  5.073364e-07    & eve bit error: 31.923988\n",
+            "  epochs:  254   bob bit error:  0.013204675  +  8.569803e-06    & eve bit error: 31.863262\n",
+            "  epochs:  255   bob bit error:  0.012997398  +  3.27691e-07    & eve bit error: 31.919199\n",
+            "  epochs:  256   bob bit error:  0.01278828  +  1.3570227e-06    & eve bit error: 31.921167\n",
+            "  epochs:  257   bob bit error:  0.012587582  +  1.6006265e-05    & eve bit error: 31.843292\n",
+            "  epochs:  258   bob bit error:  0.012387076  +  7.6152587e-06    & eve bit error: 31.874973\n",
+            "  epochs:  259   bob bit error:  0.012192698  +  2.0528485e-06    & eve bit error: 31.908808\n",
+            "  epochs:  260   bob bit error:  0.011998074  +  5.16826e-06    & eve bit error: 31.884937\n",
+            "  epochs:  261   bob bit error:  0.011808159  +  6.0980374e-06    & eve bit error: 31.873604\n",
+            "  epochs:  262   bob bit error:  0.011620628  +  2.8535762e-05    & eve bit error: 31.793991\n",
+            "  epochs:  263   bob bit error:  0.011440271  +  9.2903906e-07    & eve bit error: 31.910225\n",
+            "  epochs:  264   bob bit error:  0.011258388  +  1.0009281e-06    & eve bit error: 31.914854\n",
+            "  epochs:  265   bob bit error:  0.011083251  +  4.6891164e-06    & eve bit error: 31.884186\n",
+            "  epochs:  266   bob bit error:  0.010908693  +  8.21071e-06    & eve bit error: 31.864824\n",
+            "  epochs:  267   bob bit error:  0.010741085  +  2.5656277e-07    & eve bit error: 31.940395\n",
+            "  epochs:  268   bob bit error:  0.010570276  +  3.5370988e-07    & eve bit error: 31.924458\n",
+            "  epochs:  269   bob bit error:  0.0104071405  +  2.1928213e-06    & eve bit error: 31.911425\n",
+            "  epochs:  270   bob bit error:  0.010242505  +  3.7267346e-06    & eve bit error: 31.9029\n",
+            "  epochs:  271   bob bit error:  0.010083081  +  9.995396e-06    & eve bit error: 31.868221\n",
+            "  epochs:  272   bob bit error:  0.009927974  +  5.4274665e-09    & eve bit error: 31.961433\n",
+            "  epochs:  273   bob bit error:  0.009771742  +  3.9102833e-06    & eve bit error: 31.904715\n",
+            "  epochs:  274   bob bit error:  0.009617026  +  5.027495e-06    & eve bit error: 31.897205\n",
+            "  epochs:  275   bob bit error:  0.009471038  +  4.0008723e-07    & eve bit error: 31.970295\n",
+            "  epochs:  276   bob bit error:  0.00931754  +  5.2117125e-06    & eve bit error: 31.897167\n",
+            "  epochs:  277   bob bit error:  0.009173962  +  5.672979e-08    & eve bit error: 31.958977\n",
+            "  epochs:  278   bob bit error:  0.009031574  +  2.4682272e-06    & eve bit error: 31.9014\n",
+            "  epochs:  279   bob bit error:  0.008890119  +  1.940173e-06    & eve bit error: 31.903929\n",
+            "  epochs:  280   bob bit error:  0.008752827  +  9.670564e-06    & eve bit error: 31.865622\n",
+            "  epochs:  281   bob bit error:  0.008618485  +  6.191186e-07    & eve bit error: 31.930325\n",
+            "  epochs:  282   bob bit error:  0.008481601  +  6.697918e-08    & eve bit error: 31.932049\n",
+            "  epochs:  283   bob bit error:  0.008354941  +  6.864198e-09    & eve bit error: 31.946285\n",
+            "  epochs:  284   bob bit error:  0.008222586  +  6.9484054e-07    & eve bit error: 31.922562\n",
+            "  epochs:  285   bob bit error:  0.0080943  +  4.3847135e-06    & eve bit error: 31.893177\n",
+            "  epochs:  286   bob bit error:  0.007966207  +  1.8131391e-06    & eve bit error: 31.893644\n",
+            "  epochs:  287   bob bit error:  0.00784878  +  4.836886e-06    & eve bit error: 31.888275\n",
+            "  epochs:  288   bob bit error:  0.007723368  +  7.398067e-06    & eve bit error: 31.879213\n",
+            "  epochs:  289   bob bit error:  0.0076040826  +  2.0540442e-06    & eve bit error: 31.912014\n",
+            "  epochs:  290   bob bit error:  0.0074870647  +  2.526248e-06    & eve bit error: 31.908909\n",
+            "  epochs:  291   bob bit error:  0.0073711746  +  5.736187e-06    & eve bit error: 31.88999\n",
+            "  epochs:  292   bob bit error:  0.0072593316  +  1.0591208e-07    & eve bit error: 31.93454\n",
+            "  epochs:  293   bob bit error:  0.007144378  +  6.1359685e-07    & eve bit error: 31.92849\n",
+            "  epochs:  294   bob bit error:  0.0070356205  +  2.6052987e-06    & eve bit error: 31.9164\n",
+            "  epochs:  295   bob bit error:  0.0069251866  +  2.121737e-06    & eve bit error: 31.921774\n",
+            "  epochs:  296   bob bit error:  0.0068197707  +  1.16955525e-05    & eve bit error: 32.0336\n",
+            "  epochs:  297   bob bit error:  0.0067119626  +  1.1860015e-05    & eve bit error: 31.872112\n",
+            "  epochs:  298   bob bit error:  0.006608785  +  2.3210362e-06    & eve bit error: 31.975107\n",
+            "  epochs:  299   bob bit error:  0.006505895  +  5.4147677e-08    & eve bit error: 31.943035\n",
+            "  epochs:  300   bob bit error:  0.006406101  +  7.327551e-06    & eve bit error: 31.891668\n",
+            "  epochs:  301   bob bit error:  0.006306612  +  6.365855e-06    & eve bit error: 31.995165\n",
+            "  epochs:  302   bob bit error:  0.0062087723  +  6.9672984e-07    & eve bit error: 31.963741\n",
+            "  epochs:  303   bob bit error:  0.0061150067  +  1.5557243e-06    & eve bit error: 31.909477\n",
+            "  epochs:  304   bob bit error:  0.0060167965  +  7.976562e-07    & eve bit error: 31.959988\n",
+            "  epochs:  305   bob bit error:  0.0059279213  +  7.1304385e-10    & eve bit error: 31.958363\n",
+            "  epochs:  306   bob bit error:  0.0058317967  +  2.9754815e-06    & eve bit error: 31.987726\n",
+            "  epochs:  307   bob bit error:  0.0057436777  +  1.2892887e-06    & eve bit error: 31.925894\n",
+            "  epochs:  308   bob bit error:  0.0056594303  +  3.574142e-06    & eve bit error: 31.997723\n",
+            "  epochs:  309   bob bit error:  0.0055652955  +  4.724548e-06    & eve bit error: 31.905931\n",
+            "  epochs:  310   bob bit error:  0.0054864213  +  1.4316407e-05    & eve bit error: 32.025757\n",
+            "  epochs:  311   bob bit error:  0.0053988704  +  1.4319114e-05    & eve bit error: 31.872992\n",
+            "  epochs:  312   bob bit error:  0.00531717  +  1.4110137e-06    & eve bit error: 31.92105\n",
+            "  epochs:  313   bob bit error:  0.005235797  +  1.1567136e-06    & eve bit error: 31.981426\n",
+            "  epochs:  314   bob bit error:  0.0051512914  +  1.8451048e-05    & eve bit error: 31.856976\n",
+            "  epochs:  315   bob bit error:  0.0050806003  +  1.0864518e-05    & eve bit error: 32.001465\n",
+            "  epochs:  316   bob bit error:  0.0049918494  +  3.4903505e-06    & eve bit error: 31.923666\n",
+            "  epochs:  317   bob bit error:  0.004918286  +  2.0974954e-05    & eve bit error: 31.849174\n",
+            "  epochs:  318   bob bit error:  0.00484531  +  1.18518055e-05    & eve bit error: 32.0319\n",
+            "  epochs:  319   bob bit error:  0.0047666607  +  5.3183894e-06    & eve bit error: 31.907171\n",
+            "  epochs:  320   bob bit error:  0.004696307  +  5.781724e-07    & eve bit error: 31.934933\n",
+            "  epochs:  321   bob bit error:  0.0046228673  +  1.9573135e-06    & eve bit error: 31.977228\n",
+            "  epochs:  322   bob bit error:  0.0045466293  +  1.4140141e-05    & eve bit error: 31.86998\n",
+            "  epochs:  323   bob bit error:  0.0044827433  +  8.143896e-06    & eve bit error: 32.002457\n",
+            "  epochs:  324   bob bit error:  0.0044098967  +  5.1894203e-06    & eve bit error: 31.908398\n",
+            "  epochs:  325   bob bit error:  0.004339385  +  2.2894526e-05    & eve bit error: 31.848854\n",
+            "  epochs:  326   bob bit error:  0.0042825914  +  2.5925074e-05    & eve bit error: 32.035133\n",
+            "  epochs:  327   bob bit error:  0.0042084455  +  3.5360354e-05    & eve bit error: 31.827766\n",
+            "  epochs:  328   bob bit error:  0.0041450225  +  1.0422539e-06    & eve bit error: 31.979282\n",
+            "  epochs:  329   bob bit error:  0.004084453  +  5.976191e-06    & eve bit error: 31.91513\n",
+            "  epochs:  330   bob bit error:  0.004014739  +  1.1271804e-05    & eve bit error: 31.886501\n",
+            "  epochs:  331   bob bit error:  0.0039614057  +  2.3334685e-05    & eve bit error: 32.03779\n",
+            "  epochs:  332   bob bit error:  0.0039033196  +  1.1233664e-06    & eve bit error: 31.925577\n",
+            "  epochs:  333   bob bit error:  0.0038342846  +  1.3659274e-05    & eve bit error: 31.88671\n",
+            "  epochs:  334   bob bit error:  0.0037807585  +  1.0941669e-05    & eve bit error: 31.99516\n",
+            "  epochs:  335   bob bit error:  0.003717197  +  4.0247305e-06    & eve bit error: 31.920984\n",
+            "  epochs:  336   bob bit error:  0.003662772  +  3.5381738e-06    & eve bit error: 31.904295\n",
+            "  epochs:  337   bob bit error:  0.0036066961  +  1.8091283e-06    & eve bit error: 31.913597\n",
+            "  epochs:  338   bob bit error:  0.0035565137  +  4.545926e-06    & eve bit error: 31.914982\n",
+            "  epochs:  339   bob bit error:  0.003497687  +  2.7367976e-06    & eve bit error: 31.924305\n",
+            "  epochs:  340   bob bit error:  0.0034480551  +  8.082527e-05    & eve bit error: 32.06944\n",
+            "  epochs:  341   bob bit error:  0.003391129  +  9.551195e-06    & eve bit error: 31.903402\n",
+            "  epochs:  342   bob bit error:  0.0033354638  +  1.3302997e-05    & eve bit error: 31.887766\n",
+            "  epochs:  343   bob bit error:  0.0032930109  +  3.1940326e-06    & eve bit error: 31.973095\n",
+            "  epochs:  344   bob bit error:  0.0032374603  +  9.958063e-07    & eve bit error: 31.934017\n",
+            "  epochs:  345   bob bit error:  0.0031848524  +  4.303396e-05    & eve bit error: 31.855244\n",
+            "  epochs:  346   bob bit error:  0.0031431227  +  3.730094e-05    & eve bit error: 32.035416\n",
+            "  epochs:  347   bob bit error:  0.0030934243  +  9.676868e-06    & eve bit error: 31.924948\n",
+            "  epochs:  348   bob bit error:  0.003041272  +  5.4081625e-07    & eve bit error: 31.940273\n",
+            "  epochs:  349   bob bit error:  0.0030018059  +  6.033681e-07    & eve bit error: 31.947582\n",
+            "  epochs:  350   bob bit error:  0.0029689337  +  2.046363e-06    & eve bit error: 31.962389\n",
+            "  epochs:  351   bob bit error:  0.0029047544  +  2.4010958e-05    & eve bit error: 31.880661\n",
+            "  epochs:  352   bob bit error:  0.002865843  +  1.09685e-05    & eve bit error: 31.996376\n",
+            "  epochs:  353   bob bit error:  0.0028196282  +  7.327551e-06    & eve bit error: 31.919426\n",
+            "  epochs:  354   bob bit error:  0.0027750966  +  1.2919272e-05    & eve bit error: 31.89882\n",
+            "  epochs:  355   bob bit error:  0.0027352683  +  5.036411e-05    & eve bit error: 32.04091\n",
+            "  epochs:  356   bob bit error:  0.0026911825  +  3.4931378e-05    & eve bit error: 31.856989\n",
+            "  epochs:  357   bob bit error:  0.0026494327  +  1.5684538e-05    & eve bit error: 32.001167\n",
+            "  epochs:  358   bob bit error:  0.0026141468  +  3.3501424e-06    & eve bit error: 31.93458\n",
+            "  epochs:  359   bob bit error:  0.0025675944  +  2.9350877e-05    & eve bit error: 31.893997\n",
+            "  epochs:  360   bob bit error:  0.002531922  +  3.457298e-05    & eve bit error: 32.010994\n",
+            "  epochs:  361   bob bit error:  0.0024949757  +  3.539368e-05    & eve bit error: 31.878685\n",
+            "  epochs:  362   bob bit error:  0.002457456  +  6.46389e-05    & eve bit error: 32.059425\n",
+            "  epochs:  363   bob bit error:  0.0024121292  +  5.40939e-05    & eve bit error: 31.848867\n",
+            "  epochs:  364   bob bit error:  0.002386261  +  2.3786011e-05    & eve bit error: 32.009697\n",
+            "  epochs:  365   bob bit error:  0.0023591889  +  3.36484e-07    & eve bit error: 31.964066\n",
+            "  epochs:  366   bob bit error:  0.0023044124  +  2.4822934e-06    & eve bit error: 31.940907\n",
+            "  epochs:  367   bob bit error:  0.0022744995  +  8.7437024e-07    & eve bit error: 31.955956\n",
+            "  epochs:  368   bob bit error:  0.0022496514  +  5.3078156e-07    & eve bit error: 31.957928\n",
+            "  epochs:  369   bob bit error:  0.0022029714  +  5.0494364e-08    & eve bit error: 31.93612\n",
+            "  epochs:  370   bob bit error:  0.0021724573  +  1.8525171e-06    & eve bit error: 31.932972\n",
+            "  epochs:  371   bob bit error:  0.0021424762  +  6.776511e-06    & eve bit error: 31.95242\n",
+            "  epochs:  372   bob bit error:  0.0021106955  +  1.2575803e-05    & eve bit error: 31.927029\n",
+            "  epochs:  373   bob bit error:  0.0020688998  +  1.614859e-08    & eve bit error: 31.943378\n",
+            "  epochs:  374   bob bit error:  0.002046148  +  7.4695805e-09    & eve bit error: 31.95364\n",
+            "  epochs:  375   bob bit error:  0.0020122733  +  4.7994677e-06    & eve bit error: 31.931183\n",
+            "  epochs:  376   bob bit error:  0.0019783562  +  3.3083802e-06    & eve bit error: 31.962442\n",
+            "  epochs:  377   bob bit error:  0.0019527385  +  8.771285e-06    & eve bit error: 31.93187\n",
+            "  epochs:  378   bob bit error:  0.0019205429  +  1.6803465e-06    & eve bit error: 31.934685\n",
+            "  epochs:  379   bob bit error:  0.0018898682  +  2.760712e-06    & eve bit error: 31.939644\n",
+            "  epochs:  380   bob bit error:  0.0018661369  +  1.9251183e-05    & eve bit error: 31.970499\n",
+            "  epochs:  381   bob bit error:  0.0018335755  +  2.9957186e-05    & eve bit error: 31.921143\n",
+            "  epochs:  382   bob bit error:  0.0018097218  +  5.1774827e-05    & eve bit error: 32.027958\n",
+            "  epochs:  383   bob bit error:  0.001779546  +  1.4933185e-05    & eve bit error: 31.917583\n",
+            "  epochs:  384   bob bit error:  0.0017519884  +  2.3734876e-05    & eve bit error: 32.02266\n",
+            "  epochs:  385   bob bit error:  0.0017245351  +  6.4940195e-09    & eve bit error: 31.957907\n",
+            "  epochs:  386   bob bit error:  0.0017003552  +  3.2792304e-05    & eve bit error: 31.896431\n",
+            "  epochs:  387   bob bit error:  0.0016743131  +  2.4901106e-05    & eve bit error: 32.009132\n",
+            "  epochs:  388   bob bit error:  0.0016520801  +  4.9333185e-06    & eve bit error: 31.93628\n",
+            "  epochs:  389   bob bit error:  0.0016222498  +  2.494872e-07    & eve bit error: 31.959484\n",
+            "  epochs:  390   bob bit error:  0.0015978005  +  2.13478e-06    & eve bit error: 31.930624\n",
+            "  epochs:  391   bob bit error:  0.001573161  +  7.0656483e-06    & eve bit error: 31.927534\n",
+            "  epochs:  392   bob bit error:  0.0015558414  +  1.2446356e-05    & eve bit error: 31.937635\n",
+            "  epochs:  393   bob bit error:  0.0015277716  +  5.5920464e-07    & eve bit error: 31.945057\n",
+            "  epochs:  394   bob bit error:  0.0015023788  +  5.0453826e-07    & eve bit error: 31.943645\n",
+            "  epochs:  395   bob bit error:  0.0014887601  +  3.2759358e-06    & eve bit error: 31.914646\n",
+            "  epochs:  396   bob bit error:  0.001461305  +  1.3238726e-05    & eve bit error: 31.96824\n",
+            "  epochs:  397   bob bit error:  0.032775953  +  7.432125e-05    & eve bit error: 32.025635\n",
+            "  epochs:  398   bob bit error:  0.4864586  +  3.8643713e-05    & eve bit error: 31.70543\n",
+            "  epochs:  399   bob bit error:  0.28668627  +  0.0048645237    & eve bit error: 29.67533\n",
+            "  epochs:  400   bob bit error:  0.13850047  +  0.009833453    & eve bit error: 28.77044\n",
+            "  epochs:  401   bob bit error:  0.0844543  +  0.011057522    & eve bit error: 28.58701\n",
+            "  epochs:  402   bob bit error:  0.028947152  +  0.013128202    & eve bit error: 28.300203\n",
+            "  epochs:  403   bob bit error:  0.038681276  +  0.013598432    & eve bit error: 28.228128\n",
+            "  epochs:  404   bob bit error:  0.017203297  +  0.01332502    & eve bit error: 28.291756\n",
+            "  epochs:  405   bob bit error:  0.017140279  +  0.014429298    & eve bit error: 28.136738\n",
+            "  epochs:  406   bob bit error:  0.017047262  +  0.013894876    & eve bit error: 28.19629\n",
+            "  epochs:  407   bob bit error:  0.019003943  +  0.014319119    & eve bit error: 28.149559\n",
+            "  epochs:  408   bob bit error:  0.021431424  +  0.013494995    & eve bit error: 28.268055\n",
+            "  epochs:  409   bob bit error:  0.01699925  +  0.012060186    & eve bit error: 28.448597\n",
+            "  epochs:  410   bob bit error:  0.01715624  +  0.010606517    & eve bit error: 28.67435\n",
+            "  epochs:  411   bob bit error:  0.017194826  +  0.010027322    & eve bit error: 28.775612\n",
+            "  epochs:  412   bob bit error:  0.017114239  +  0.009634806    & eve bit error: 28.826397\n",
+            "  epochs:  413   bob bit error:  0.017052367  +  0.00898348    & eve bit error: 28.936392\n",
+            "  epochs:  414   bob bit error:  0.00980572  +  0.008752299    & eve bit error: 28.979527\n",
+            "  epochs:  415   bob bit error:  0.009310585  +  0.00797042    & eve bit error: 29.1129\n",
+            "  epochs:  416   bob bit error:  0.009339019  +  0.0071564494    & eve bit error: 29.251785\n",
+            "  epochs:  417   bob bit error:  0.009239823  +  0.006911836    & eve bit error: 29.308983\n",
+            "  epochs:  418   bob bit error:  0.009102151  +  0.0061144917    & eve bit error: 29.466387\n",
+            "  epochs:  419   bob bit error:  0.009017584  +  0.005199121    & eve bit error: 29.658264\n",
+            "  epochs:  420   bob bit error:  0.009027048  +  0.0047417562    & eve bit error: 29.77349\n",
+            "  epochs:  421   bob bit error:  0.00906596  +  0.004349148    & eve bit error: 29.867678\n",
+            "  epochs:  422   bob bit error:  0.009064103  +  0.003603327    & eve bit error: 30.04245\n",
+            "  epochs:  423   bob bit error:  0.009100154  +  0.0032762345    & eve bit error: 30.128399\n",
+            "  epochs:  424   bob bit error:  0.009215488  +  0.0033777142    & eve bit error: 30.097641\n",
+            "  epochs:  425   bob bit error:  0.008995475  +  0.0034975992    & eve bit error: 30.066967\n",
+            "  epochs:  426   bob bit error:  0.009215452  +  0.0028482804    & eve bit error: 30.26146\n",
+            "  epochs:  427   bob bit error:  0.009355058  +  0.002370457    & eve bit error: 30.396593\n",
+            "  epochs:  428   bob bit error:  0.008908603  +  0.0021494501    & eve bit error: 30.477848\n",
+            "  epochs:  429   bob bit error:  0.00889223  +  0.0021238436    & eve bit error: 30.470543\n",
+            "  epochs:  430   bob bit error:  0.008882281  +  0.0019132427    & eve bit error: 30.554983\n",
+            "  epochs:  431   bob bit error:  0.008850618  +  0.0015007167    & eve bit error: 30.72487\n",
+            "  epochs:  432   bob bit error:  0.008891059  +  0.0012676703    & eve bit error: 30.816444\n",
+            "  epochs:  433   bob bit error:  0.008942945  +  0.0011294389    & eve bit error: 30.885456\n",
+            "  epochs:  434   bob bit error:  0.008987312  +  0.00088423217    & eve bit error: 31.00403\n",
+            "  epochs:  435   bob bit error:  0.008964751  +  0.0008503104    & eve bit error: 31.018856\n",
+            "  epochs:  436   bob bit error:  0.008919733  +  0.00083257124    & eve bit error: 31.042187\n",
+            "  epochs:  437   bob bit error:  0.008866322  +  0.00075742265    & eve bit error: 31.064014\n",
+            "  epochs:  438   bob bit error:  0.0088249035  +  0.0006858309    & eve bit error: 31.11054\n",
+            "  epochs:  439   bob bit error:  0.0087895915  +  0.00059755496    & eve bit error: 31.174559\n",
+            "  epochs:  440   bob bit error:  0.008758726  +  0.0005081391    & eve bit error: 31.232407\n",
+            "  epochs:  441   bob bit error:  0.008738929  +  0.00045161357    & eve bit error: 31.27321\n",
+            "  epochs:  442   bob bit error:  0.008728909  +  0.00034667386    & eve bit error: 31.345646\n",
+            "  epochs:  443   bob bit error:  0.008732434  +  0.0003240496    & eve bit error: 31.362644\n",
+            "  epochs:  444   bob bit error:  0.008751822  +  0.00048600376    & eve bit error: 31.243427\n",
+            "  epochs:  445   bob bit error:  0.008768881  +  0.00039042984    & eve bit error: 31.325396\n",
+            "  epochs:  446   bob bit error:  0.008760255  +  0.000275889    & eve bit error: 31.413717\n",
+            "  epochs:  447   bob bit error:  0.008720474  +  0.00019614352    & eve bit error: 31.488476\n",
+            "  epochs:  448   bob bit error:  0.008682604  +  0.0002335078    & eve bit error: 31.458965\n",
+            "  epochs:  449   bob bit error:  0.0086581055  +  0.0002201798    & eve bit error: 31.465786\n",
+            "  epochs:  450   bob bit error:  0.008637959  +  0.00014681226    & eve bit error: 31.562222\n",
+            "  epochs:  451   bob bit error:  0.008616598  +  0.00011518467    & eve bit error: 31.588106\n",
+            "  epochs:  452   bob bit error:  0.008606545  +  0.00012739847    & eve bit error: 31.58443\n",
+            "  epochs:  453   bob bit error:  0.008602537  +  0.00012659244    & eve bit error: 31.572819\n",
+            "  epochs:  454   bob bit error:  0.008603649  +  0.00011018646    & eve bit error: 31.607872\n",
+            "  epochs:  455   bob bit error:  0.008603735  +  0.00010138142    & eve bit error: 31.616066\n",
+            "  epochs:  456   bob bit error:  0.008592479  +  8.778739e-05    & eve bit error: 31.63565\n",
+            "  epochs:  457   bob bit error:  0.008583553  +  0.00017387001    & eve bit error: 31.540758\n",
+            "  epochs:  458   bob bit error:  0.0085680755  +  0.00011211311    & eve bit error: 31.592993\n",
+            "  epochs:  459   bob bit error:  0.008550268  +  6.363932e-05    & eve bit error: 31.679691\n",
+            "  epochs:  460   bob bit error:  0.008532942  +  3.140514e-05    & eve bit error: 31.757242\n",
+            "  epochs:  461   bob bit error:  0.008514723  +  4.723501e-05    & eve bit error: 31.720518\n",
+            "  epochs:  462   bob bit error:  0.008488187  +  3.5471738e-05    & eve bit error: 31.747818\n",
+            "  epochs:  463   bob bit error:  0.0083276555  +  3.756935e-05    & eve bit error: 31.747227\n",
+            "  epochs:  464   bob bit error:  0.0006755111  +  3.2076743e-05    & eve bit error: 31.762108\n",
+            "  epochs:  465   bob bit error:  0.00066648424  +  1.0746307e-06    & eve bit error: 31.899311\n",
+            "  epochs:  466   bob bit error:  0.0006576122  +  1.9768752e-06    & eve bit error: 31.890753\n",
+            "  epochs:  467   bob bit error:  0.00064870785  +  7.4037877e-07    & eve bit error: 31.952175\n",
+            "  epochs:  468   bob bit error:  0.0006387874  +  9.829506e-08    & eve bit error: 31.935026\n",
+            "  epochs:  469   bob bit error:  0.0006293128  +  1.0472496e-06    & eve bit error: 31.905212\n",
+            "  epochs:  470   bob bit error:  0.00062088296  +  4.3909563e-06    & eve bit error: 31.858253\n",
+            "  epochs:  471   bob bit error:  0.0006104361  +  3.1355016e-06    & eve bit error: 31.974081\n",
+            "  epochs:  472   bob bit error:  0.00060073356  +  3.2410753e-06    & eve bit error: 31.98832\n",
+            "  epochs:  473   bob bit error:  0.00059127575  +  1.0581351e-06    & eve bit error: 31.93785\n",
+            "  epochs:  474   bob bit error:  0.000582078  +  5.207903e-06    & eve bit error: 31.87127\n",
+            "  epochs:  475   bob bit error:  0.00057354337  +  3.5399353e-07    & eve bit error: 31.946697\n",
+            "  epochs:  476   bob bit error:  0.000565503  +  1.49886e-06    & eve bit error: 31.963736\n",
+            "  epochs:  477   bob bit error:  0.0005571274  +  6.089209e-08    & eve bit error: 31.915369\n",
+            "  epochs:  478   bob bit error:  0.00054899487  +  4.1071326e-07    & eve bit error: 31.913036\n",
+            "  epochs:  479   bob bit error:  0.0005411543  +  5.7319767e-07    & eve bit error: 31.958672\n",
+            "  epochs:  480   bob bit error:  0.0005334122  +  7.656183e-09    & eve bit error: 31.9312\n",
+            "  epochs:  481   bob bit error:  0.00052391784  +  1.9718449e-07    & eve bit error: 31.9268\n",
+            "  epochs:  482   bob bit error:  0.0005156386  +  1.7502884e-06    & eve bit error: 31.885834\n",
+            "  epochs:  483   bob bit error:  0.00050793216  +  6.017937e-06    & eve bit error: 31.865276\n",
+            "  epochs:  484   bob bit error:  0.00049879984  +  1.5326385e-05    & eve bit error: 31.810444\n",
+            "  epochs:  485   bob bit error:  0.0004908608  +  7.2812105e-07    & eve bit error: 31.962822\n",
+            "  epochs:  486   bob bit error:  0.0004832826  +  2.0107084e-08    & eve bit error: 31.936413\n",
+            "  epochs:  487   bob bit error:  0.00047521014  +  7.9417305e-08    & eve bit error: 31.94573\n",
+            "  epochs:  488   bob bit error:  0.00046775443  +  3.554337e-08    & eve bit error: 31.910622\n",
+            "  epochs:  489   bob bit error:  0.0004606638  +  2.9041491e-06    & eve bit error: 31.882433\n",
+            "  epochs:  490   bob bit error:  0.00045383722  +  5.579573e-07    & eve bit error: 31.95131\n",
+            "  epochs:  491   bob bit error:  0.00044808746  +  8.754347e-08    & eve bit error: 31.933378\n",
+            "  epochs:  492   bob bit error:  0.00044126087  +  6.435523e-06    & eve bit error: 31.860579\n",
+            "  epochs:  493   bob bit error:  0.0004338622  +  6.9247158e-06    & eve bit error: 31.85626\n",
+            "  epochs:  494   bob bit error:  0.0004276943  +  2.0494338e-06    & eve bit error: 31.95869\n",
+            "  epochs:  495   bob bit error:  0.0004201515  +  4.327737e-06    & eve bit error: 31.872683\n",
+            "  epochs:  496   bob bit error:  0.00041310862  +  2.1725697e-09    & eve bit error: 31.944166\n",
+            "  epochs:  497   bob bit error:  0.00040654442  +  4.1262865e-06    & eve bit error: 31.978813\n",
+            "  epochs:  498   bob bit error:  0.00040050247  +  1.1145394e-06    & eve bit error: 31.9748\n",
+            "  epochs:  499   bob bit error:  0.00039392826  +  2.4123615e-06    & eve bit error: 31.981861\n"
+          ]
+        }
+      ],
+      "source": [
+        "# Training begins\n",
+        "table = []\n",
+        "temp_alice_bob_loss = 4\n",
+        "i=0\n",
+        "while i < epochs:\n",
+        "\n",
+        "\n",
+        "  for j in range(steps_per_epoch): #steps per epoch = samplesize/BATCH_SIZE\n",
+        "\n",
+        "    # get batch dataset to train\n",
+        "    batch_messages = messages[j*batch_size: (j+1)*batch_size]\n",
+        "    batch_keys     = keys[j*batch_size: (j+1)*batch_size]\n",
+        "\n",
+        "    # Train Alice and Bob\n",
+        "    for _ in range(ITERS_PER_ACTOR):\n",
+        "      temp = sess.run([bob_opt, Bob_loss, Eve_evadropping_loss, Bob_out_message],\n",
+        "                      feed_dict={Alice_input_message:batch_messages , Alice_input_key:batch_keys })\n",
+        "\n",
+        "      temp_alice_bob_loss = temp[1]\n",
+        "      temp_eve_evs_loss   = temp[2]\n",
+        "      temp_bob_msg        = temp[3]\n",
+        "\n",
+        "    # train Eve\n",
+        "    for _ in range(ITERS_PER_ACTOR*EVE_MULTIPLIER):\n",
+        "      temp = sess.run([Eve_opt, Eves_loss, Eve_out_message], feed_dict={Alice_input_message:batch_messages , Alice_input_key:batch_keys })\n",
+        "\n",
+        "      temp_eve_loss = temp[1]\n",
+        "      temp_eve_msg  = temp[2]\n",
+        "\n",
+        "    table.append([i,temp_alice_bob_loss,temp_eve_loss,temp_alice_bob_loss + temp_eve_evs_loss])\n",
+        "\n",
+        "  # save after every 500 epochs\n",
+        "  if i%500 == 0 and i!=0:\n",
+        "    alice_saver.save(sess, \"weights/alice_weights/model.ckpt\")\n",
+        "    bob_saver.save(sess, \"weights/bob_weights/model.ckpt\")\n",
+        "    eve_saver.save(sess, \"weights/eve_weights/model.ckpt\")\n",
+        "\n",
+        "\n",
+        "  # output bit error and loss after every 100 epochs\n",
+        "  if i%1 == 0:\n",
+        "    print('  epochs: ', i, '  bob bit error: ', temp_alice_bob_loss,' + ', temp_eve_evs_loss,'   & eve bit error:', temp_eve_loss)\n",
+        "  i=i+1\n",
+        "\n"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "5jiqVcRmvtlj"
+      },
+      "outputs": [],
+      "source": [
+        "df = pd.DataFrame(table, columns=['Epoch Number', 'Bob Loss', 'Eve Loss','ABE loss'])"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/",
+          "height": 1000
+        },
+        "id": "MFHOQ3yZtcDs",
+        "outputId": "d2d96893-d0ab-47be-9de6-efcdb5ba504a"
+      },
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "Bob Loss Graph\n"
+          ]
+        },
+        {
+          "output_type": "display_data",
+          "data": {
+            "text/plain": [
+              "<Figure size 640x480 with 1 Axes>"
+            ],
+            "image/png": "iVBORw0KGgoAAAANSUhEUgAAAjIAAAHHCAYAAACle7JuAAAAOXRFWHRTb2Z0d2FyZQBNYXRwbG90bGliIHZlcnNpb24zLjcuMSwgaHR0cHM6Ly9tYXRwbG90bGliLm9yZy/bCgiHAAAACXBIWXMAAA9hAAAPYQGoP6dpAABCFElEQVR4nO3dd3gVZf7//9dJO+kVSEBCW5CeoNQIuiBRQERAbMgqsLgsGhDE1YWvhbK4WBcWBOwgHwuKP8EKyEbBRelKE0VwKVFSREhCAimQ+/cHMHIIoYSQOROej+uayzP33HOf97kPu+eVOTNnXMYYIwAAAAfysbsAAACA8iLIAAAAxyLIAAAAxyLIAAAAxyLIAAAAxyLIAAAAxyLIAAAAxyLIAAAAxyLIAAAAxyLIADgtl8ul4cOH213GJY/3ATgzggzgcHPmzJHL5fJYatSooS5dumjRokW21LRr1y65XC49++yztjz/+crKytKYMWPUsmVLhYaGKjAwUA0bNtTgwYO1YsUKu8sDcAZ+dhcAoGJMnDhR9evXlzFGmZmZmjNnjm644QZ99NFHuvHGG+0uz2utWbNGPXv21MGDB3XHHXdo2LBhcrvd2rlzpxYuXKg5c+Zo+fLluuaaa+wuFcBpEGSAKqJHjx5q06aNtT5kyBDFxsbq7bffJsiU4cCBA+rTp4/8/Py0YcMGNWnSxGP7pEmTNG/ePAUFBZ1xnPz8fIWEhFzMUgGUga+WgCoqMjJSQUFB8vPz/HslPz9fDz74oOLj4+V2u9W4cWM9++yzMsacdpw333xTjRs3VmBgoFq3bq0vv/yywmrMysqyAldgYKASExP1+uuvl+o3b948tW7dWmFhYQoPD1fLli3173//29peXFysCRMmqFGjRgoMDFRMTIw6deqkpUuXnvH5X3jhBaWnp2vq1KmlQox07PyU/v37q23btlbb+PHj5XK5tHXrVt15552KiopSp06dJEmbNm3SoEGD1KBBAwUGBiouLk5//vOf9dtvv3mMe2KMH374QbfddpvCw8MVExOjkSNHqqCg4LS1Lly4UC1atJDb7Vbz5s21ePHiM7424FLBERmgisjJydG+fftkjFFWVpamT5+uvLw8/elPf7L6GGN000036YsvvtCQIUPUqlUrLVmyRA899JB++eUXTZkyxWPM5cuX65133tH9998vt9utmTNnqnv37lqzZo1atGhxQfUePnxYnTt31o4dOzR8+HDVr19f8+fP16BBg5Sdna2RI0dKkpYuXar+/fura9eueuqppyRJ33//vb766iurz/jx4zV58mTdc889ateunXJzc7Vu3Tp98803uu6668qs4aOPPlJQUJBuvvnm867/1ltvVaNGjfTPf/7TCoFLly7V//73Pw0ePFhxcXH67rvv9NJLL+m7777TqlWr5HK5PMa47bbbVK9ePU2ePFmrVq3StGnTdODAAc2dO9ej34oVK/T+++/rvvvuU1hYmKZNm6Z+/fppz549iomJOe/agSrFAHC02bNnG0mlFrfbbebMmePRd+HChUaSmTRpkkf7LbfcYlwul9mxY4fVdmKcdevWWW27d+82gYGBpm/fvmesaefOnUaSeeaZZ8rsM3XqVCPJvPHGG1ZbUVGRSUpKMqGhoSY3N9cYY8zIkSNNeHi4OXLkSJljJSYmmp49e56xptOJiooyrVq1KtWem5trfv31V2vJy8uzto0bN85IMv379y+136FDh0q1vf3220aS+fLLL0uNcdNNN3n0ve+++4wks3HjRqtNkgkICPB4bzZu3GgkmenTp5/fCwaqIL5aAqqIGTNmaOnSpVq6dKneeOMNdenSRffcc4/ef/99q8+nn34qX19f3X///R77PvjggzLGlLrKKSkpSa1bt7bW69Spo969e2vJkiU6evToBdX76aefKi4uTv3797fa/P39df/99ysvL0/Lly+XdOwrsvz8/DN+TRQZGanvvvtO27dvP68acnNzFRoaWqr9rrvuUvXq1a3l73//e6k+w4YNK9V28rk0BQUF2rdvnzp06CBJ+uabb0r1T0lJ8VgfMWKEpGNzc7Lk5GT94Q9/sNYTEhIUHh6u//3vf2d6ecAlgSADVBHt2rVTcnKykpOTNWDAAH3yySdq1qyZhg8frqKiIknS7t27VatWLYWFhXns27RpU2v7yRo1alTqeS6//HIdOnRIv/766wXVu3v3bjVq1Eg+Pp7/N3RqLffdd58uv/xy9ejRQ7Vr19af//znUueHTJw4UdnZ2br88svVsmVLPfTQQ9q0adNZawgLC1NeXl6p9okTJ1qhsCz169cv1bZ//36NHDlSsbGxCgoKUvXq1a1+OTk5pfqfOr9/+MMf5OPjo127dnm016lTp9S+UVFROnDgQJn1AZcKggxQRfn4+KhLly5KT08/7yMV3qRGjRrasGGDPvzwQ+v8nh49emjgwIFWn2uuuUY//fSTXnvtNbVo0UKvvPKKrrzySr3yyitnHLtJkybatm2biouLPdoTEhKsUFiW013JdNttt+nll1/WsGHD9P777+uzzz6zQldJSclZX+up59Cc4Ovre9p2U8YJ2sClhCADVGFHjhyRJOuoQ926dbV3714dPHjQo98PP/xgbT/Z6QLQjz/+qODgYFWvXv2Caqtbt662b99e6gP+dLUEBASoV69emjlzpn766Sf99a9/1dy5c7Vjxw6rT3R0tAYPHqy3335baWlpSkhI0Pjx489Yw4033qjDhw9rwYIFF/RapGOXcqempmrMmDGaMGGC+vbtq+uuu04NGjQoc59T53fHjh0qKSlRvXr1Lrge4FJBkAGqqOLiYn322WcKCAiwvq654YYbdPToUT3//PMefadMmSKXy6UePXp4tK9cudLj3I60tDR98MEHuv7668s8SnCubrjhBmVkZOidd96x2o4cOaLp06crNDRUf/zjHyWp1KXLPj4+SkhIkCQVFhaetk9oaKgaNmxobS/Lvffeq9jYWD3wwAP68ccfS20/nyMeJ+bj1H2mTp1a5j4zZszwWJ8+fboklXofAJSNy6+BKmLRokXW0YysrCy99dZb2r59u8aMGaPw8HBJUq9evdSlSxc98sgj2rVrlxITE/XZZ5/pgw8+0KhRozxOKJWkFi1aqFu3bh6XX0vShAkTzqmm1NTU0/4uSp8+fTR06FC9+OKLGjRokNavX6969erpvffe01dffaWpU6da5/Hcc8892r9/v6699lrVrl1bu3fv1vTp09WqVSsroDVr1kydO3dW69atFR0drXXr1um999476z2KoqOjtWDBAvXq1UuJiYm644471LZtW/n7+ystLU3z58+XdPpzVE4VHh6ua665Rk8//bSKi4t12WWX6bPPPtPOnTvL3Gfnzp266aab1L17d61cuVJvvPGG7rzzTiUmJp71+QAcZ+9FUwAu1Okuvw4MDDStWrUys2bNMiUlJR79Dx48aB544AFTq1Yt4+/vbxo1amSeeeaZUv0kmZSUFPPGG2+YRo0aGbfbba644grzxRdfnLWmE5dfl7X83//9nzHGmMzMTDN48GBTrVo1ExAQYFq2bGlmz57tMdZ7771nrr/+elOjRg0TEBBg6tSpY/7617+a9PR0q8+kSZNMu3btTGRkpAkKCjJNmjQxTzzxhCkqKjqnOUxPTzcPPfSQadasmQkKCjJut9s0aNDA3H333R6XTRvz+6XTv/76a6lxfv75Z9O3b18TGRlpIiIizK233mr27t1rJJlx48aVGmPr1q3mlltuMWFhYSYqKsoMHz7cHD582GPME+/DqerWrWsGDhx4Tq8PqMpcxnC2GABUpvHjx2vChAn69ddfVa1aNbvLARyNc2QAAIBjEWQAAIBjEWQAAIBjcY4MAABwLI7IAAAAxyLIAAAAx6ryP4hXUlKivXv3KiwsrMz7mAAAAO9ijNHBgwdVq1atUjeXPVmVDzJ79+5VfHy83WUAAIBySEtLU+3atcvcXuWDzImfOU9LS7N+ph0AAHi33NxcxcfHW5/jZanyQebE10nh4eEEGQAAHOZsp4Vwsi8AAHAsggwAAHAsggwAAHCsKn+ODADg0nD06FEVFxfbXQbOkb+/v3x9fS94HIIMAMDRjDHKyMhQdna23aXgPEVGRiouLu6CfueNIAMAcLQTIaZGjRoKDg7mx08dwBijQ4cOKSsrS5JUs2bNco9FkAEAONbRo0etEBMTE2N3OTgPQUFBkqSsrCzVqFGj3F8zcbIvAMCxTpwTExwcbHMlKI8T79uFnNtEkAEAOB5fJzlTRbxvBBkAAOBYBBkAABxs0KBB6tOnj91l2IYgAwCADQYNGiSXy2UtMTEx6t69uzZt2nTRn3vZsmVyuVxV4pJ1gswFyD5UpMIjR2WMsbsUAIADde/eXenp6UpPT1dqaqr8/Px044032l2WoxBkyqnvzK/UauJSNX50seqP/VT1xnzisVw1OVVZuQV2lwkA8GJut1txcXGKi4tTq1atNGbMGKWlpenXX3+1+mzevFnXXnutgoKCFBMTo6FDhyovL6/UWBMmTFD16tUVHh6uYcOGqaioqNx1HThwQHfffbeioqIUHBysHj16aPv27db23bt3q1evXoqKilJISIiaN2+uTz/91Np3wIABql69uoKCgtSoUSPNnj273LWcDb8jU07f7sk+4/a9OQVq989UvXJ3GyU3i62cogAAMsbocPFRW547yN+33Ffi5OXl6Y033lDDhg2t38TJz89Xt27dlJSUpLVr1yorK0v33HOPhg8frjlz5lj7pqamKjAwUMuWLdOuXbs0ePBgxcTE6IknnihXLYMGDdL27dv14YcfKjw8XH//+991ww03aOvWrfL391dKSoqKior05ZdfKiQkRFu3blVoaKgk6bHHHtPWrVu1aNEiVatWTTt27NDhw4fLVce5IMhcZPfMXaddT/a0uwwAuGQcLj6qZo8vseW5t07spuCAc/9o/fjjj60AkJ+fr5o1a+rjjz+Wj8+xL0zeeustFRQUaO7cuQoJCZEkPf/88+rVq5eeeuopxcYe+0M5ICBAr732moKDg9W8eXNNnDhRDz30kP7xj39YY52rEwHmq6++0lVXXSVJevPNNxUfH6+FCxfq1ltv1Z49e9SvXz+1bNlSktSgQQNr/z179uiKK65QmzZtJEn16tU7r+c/X3y1VAk+3LjX7hIAAF6oS5cu2rBhgzZs2KA1a9aoW7du6tGjh3bv3i1J+v7775WYmGiFGEnq2LGjSkpKtG3bNqstMTHR40cBk5KSlJeXp7S0tPOu6fvvv5efn5/at29vtcXExKhx48b6/vvvJUn333+/Jk2apI4dO2rcuHEeJyjfe++9mjdvnlq1aqWHH35YX3/99XnXcD44IlMJ7n/7W92UWMvuMgDgkhDk76utE7vZ9tznIyQkRA0bNrTWX3nlFUVEROjll1/WpEmTKrq8CnPPPfeoW7du+uSTT/TZZ59p8uTJeu655zRixAgriH366adaunSpunbtqpSUFD377LMXpRaOyAAAqhSXy6XgAD9blgv9pVqXyyUfHx/rnJKmTZtq48aNys/Pt/p89dVX8vHxUePGja22jRs3epyHsmrVKoWGhio+Pv68a2jatKmOHDmi1atXW22//fabtm3bpmbNmllt8fHxGjZsmN5//309+OCDevnll61t1atX18CBA/XGG29o6tSpeumll867jnPFERkAAGxSWFiojIwMSceu9nn++eeVl5enXr16SZIGDBigcePGaeDAgRo/frx+/fVXjRgxQnfddZd1fowkFRUVaciQIXr00Ue1a9cujRs3TsOHDz/r+TGbN29WWFiYte5yuZSYmKjevXvrL3/5i1588UWFhYVpzJgxuuyyy9S7d29J0qhRo9SjRw9dfvnlOnDggL744gs1bdpUkvT444+rdevWat68uQoLC/Xxxx9b2y4GggwAADZZvHixatasKUkKCwtTkyZNNH/+fHXu3FnSsZsqLlmy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BABAVWXbEZm0tDSNHDlSb775pgIDAyts3MmTJysiIsJa4uPjK2xsAADgXWwLMuvXr1dWVpauvPJK+fn5yc/PT8uXL9e0adPk5+en2NhYFRUVKTs722O/zMxMxcXFlTnu2LFjlZOTYy1paWkX+ZUAAAC72PbVUteuXbV582aPtsGDB6tJkyb6+9//rvj4ePn7+ys1NVX9+vWTJG3btk179uxRUlJSmeO63W653e6LWjsAAPAOtgWZsLAwtWjRwqMtJCREMTExVvuQIUM0evRoRUdHKzw8XCNGjFBSUpI6dOhgR8kAAMDL2Hqy79lMmTJFPj4+6tevnwoLC9WtWzfNnDnT7rIAAICX8Kogs2zZMo/1wMBAzZgxQzNmzLCnIAAA4NVs/x0ZAACA8iLIAAAAxyLIAAAAxyLIAAAAxyLIAAAAxyLIAAAAxyLIAAAAxyLIAAAAxyLIAAAAxyLIAAAAxyLIAAAAxyLIAAAAxyLIVDIfl0uSVHCkROt3H7C5GgAAnI0gU8lqRwXpqj/E6GiJ0aRPttpdDgAAjkaQqWQul0sPXHe5JCn7ULHN1QAA4GwEGRu47C4AAIAqgiADAAAciyADAAAciyADAAAciyADAAAciyADAAAcq1xBJi0tTT///LO1vmbNGo0aNUovvfRShRUGAABwNuUKMnfeeae++OILSVJGRoauu+46rVmzRo888ogmTpxYoQUCAACUpVxBZsuWLWrXrp0k6d1331WLFi309ddf680339ScOXMqsj4AAIAylSvIFBcXy+12S5L+85//6KabbpIkNWnSROnp6RVXHQAAwBmUK8g0b95cL7zwgv773/9q6dKl6t69uyRp7969iomJqdACAQAAylKuIPPUU0/pxRdfVOfOndW/f38lJiZKkj788EPrKycAAICLza88O3Xu3Fn79u1Tbm6uoqKirPahQ4cqODi4wooDAAA4k3IdkTl8+LAKCwutELN7925NnTpV27ZtU40aNSq0QAAAgLKUK8j07t1bc+fOlSRlZ2erffv2eu6559SnTx/NmjWrQgsEAAAoS7mCzDfffKOrr75akvTee+8pNjZWu3fv1ty5czVt2rQKLRAAAKAs5Qoyhw4dUlhYmCTps88+08033ywfHx916NBBu3fvrtACAQAAylKuINOwYUMtXLhQaWlpWrJkia6//npJUlZWlsLDwyu0QAAAgLKUK8g8/vjj+tvf/qZ69eqpXbt2SkpKknTs6MwVV1xRoQUCAACUpVyXX99yyy3q1KmT0tPTrd+QkaSuXbuqb9++FVYcAADAmZQryEhSXFyc4uLirLtg165dmx/DAwAAlapcXy2VlJRo4sSJioiIUN26dVW3bl1FRkbqH//4h0pKSiq6RgAAgNMq1xGZRx55RK+++qqefPJJdezYUZK0YsUKjR8/XgUFBXriiScqtEgAAIDTKVeQef311/XKK69Yd72WpISEBF122WW67777CDIAAKBSlOurpf3796tJkyal2ps0aaL9+/dfcFEAAADnolxBJjExUc8//3yp9ueff14JCQkXXBQAAMC5KFeQefrpp/Xaa6+pWbNmGjJkiIYMGaJmzZppzpw5evbZZ895nFmzZikhIUHh4eEKDw9XUlKSFi1aZG0vKChQSkqKYmJiFBoaqn79+ikzM7M8JXsVl8slSco+VKRDRUdsrgYAAOcqV5D54x//qB9//FF9+/ZVdna2srOzdfPNN+u7777T//3f/53zOLVr19aTTz6p9evXa926dbr22mvVu3dvfffdd5KkBx54QB999JHmz5+v5cuXa+/evbr55pvLU7JXaVYzXLUiAnXgULGmpe6wuxwAABzLZYwxFTXYxo0bdeWVV+ro0aPlHiM6OlrPPPOMbrnlFlWvXl1vvfWWbrnlFknSDz/8oKZNm2rlypXq0KHDOY2Xm5uriIgI5eTkeNXtE95dm6aH/79Nalc/Wu/+NcnucgAA8Crn+vldriMyF8PRo0c1b9485efnKykpSevXr1dxcbGSk5OtPk2aNFGdOnW0cuXKMscpLCxUbm6ux+KNQgPL/VuEAADgONuDzObNmxUaGiq3261hw4ZpwYIFatasmTIyMhQQEKDIyEiP/rGxscrIyChzvMmTJysiIsJa4uPjL/IrAAAAdrE9yDRu3FgbNmzQ6tWrde+992rgwIHaunVruccbO3ascnJyrCUtLa0CqwUAAN7kvL7fONuJttnZ2eddQEBAgBo2bChJat26tdauXat///vfuv3221VUVKTs7GyPozKZmZmKi4srczy32y23233edQAAAOc5ryATERFx1u133333BRVUUlKiwsJCtW7dWv7+/kpNTVW/fv0kSdu2bdOePXuUlMTJsQAA4DyDzOzZsyv0yceOHasePXqo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c9lll5nbb7/d7Nixw9ruTfPsMsaYij3GAwAAUDk4RwYAADgWQQYAADgWQQYAADgWQQYAADgWQQYAADgWQQYAADgWQQYAADgWQQaArVwulxYuXGh3Gedl2bJlcrlcpe41A6DyEWSAS9SgQYPkcrlKLd27d7e7tLPq3LmzXC6X5s2b59E+depU1atXz56iANiCIANcwrp376709HSP5e2337a7rHMSGBioRx99VMXFxXaXUmGKiorsLgFwHIIMcAlzu92Ki4vzWKKioqztLpdLs2bNUo8ePRQUFKQGDRrovffe8xhj8+bNuvbaaxUUFKSYmBgNHTpUeXl5Hn1ee+01NW/eXG63WzVr1tTw4cM9tu/bt099+/ZVcHCwGjVqpA8//PCstffv31/Z2dl6+eWXy+wzaNAg9enTx6Nt1KhR6ty5s7XeuXNnjRgxQqNGjVJUVJRiY2P18ssvKz8/X4MHD1ZYWJgaNmyoRYsWlRr/q6++UkJCggIDA9WhQwdt2bLFY/uKFSt09dVXKygoSPHx8br//vuVn59vba9Xr57+8Y9/6O6771Z4eLiGDh161tcNwBNBBsAZPfbYY+rXr582btyoAQMG6I477tD3338vScrPz1e3bt0UFRWltWvXav78+frPf/7jEVRmzZqllJQUDR06VJs3b9aHH36ohg0bejzHhAkTdNttt2nTpk264YYbNGDAAO3fv/+MdYWHh+uRRx7RxIkTPcJBebz++uuqVq2a1qxZoxEjRujee+/VrbfeqquuukrffPONrr/+et111106dOiQx34PPfSQnnvuOa1du1bVq1dXr169rCNEP/30k7p3765+/fpp06ZNeuedd7RixYpSIe7ZZ59VYmKivv32Wz322GMX9DqAS1KF34YSgCMMHDjQ+Pr6mpCQEI/liSeesPpIMsOGDfPYr3379ubee+81xhjz0ksvmaioKJOXl2dt/+STT4yPj4/JyMgwxhhTq1Yt88gjj5RZhyTz6KOPWut5eXlGklm0aFGZ+5y443FBQYGpW7eumThxojHGmClTppi6det6vMbevXt77Dty5Ejzxz/+0WOsTp06WetHjhwxISEh5q677rLa0tPTjSSzcuVKY8zvd2+fN2+e1ee3334zQUFB5p133jHGGDNkyBAzdOhQj+f+73//a3x8fMzhw4eNMcbUrVvX9OnTp8zXCeDs/GxNUQBs1aVLF82aNcujLTo62mM9KSmp1PqGDRskSd9//70SExMVEhJibe/YsaNKSkq0bds2uVwu7d27V127dj1jHQkJCdbjkJAQhYeHKysr66z1u91uTZw40TqKUl4nP7+vr69iYmLUsmVLqy02NlaSStV08txER0ercePG1tGqjRs3atOmTXrzzTetPsYYlZSUaOfOnWratKkkqU2bNuWuG4BEkAEuYSEhIaW+5qlIQUFB59TP39/fY93lcqmkpOSc9v3Tn/6kZ599VpMmTSp1xZKPj4+MMR5tpzs5+HTPf3Kby+WSpHOuSZLy8vL017/+Vffff3+pbXXq1LEenxwCAZw/zpEBcEarVq0qtX7iaELTpk21ceNGj3NUvvrqK/n4+Khx48YKCwtTvXr1lJqaetHq8/Hx0eTJkzVr1izt2rXLY1v16tWVnp7u0XbiaFJFOHluDhw4oB9//NGamyuvvFJbt25Vw4YNSy0BAQEVVgNwqSPIAJewwsJCZWRkeCz79u3z6DN//ny99tpr+vHHHzVu3DitWbPGOmF1wIABCgwM1MCBA7VlyxZ98cUXGjFihO666y7r65jx48frueee07Rp07R9+3Z98803mj59eoW+jp49e6p9+/Z68cUXPdqvvfZarVu3TnPnztX27ds1bty4UlcWXYiJEycqNTVVW7Zs0aBBg1StWjXrKqm///3v+vrrrzV8+HBt2LBB27dv1wcffFDqZF8AF4YgA1zCFi9erJo1a3osnTp18ugzYcIEzZs3TwkJCZo7d67efvttNWvWTJIUHBysJUuWaP/+/Wrbtq1uueUWde3aVc8//7y1/8CBAzV16lTNnDlTzZs314033qjt27dX+Gt56qmnVFBQ4NHWrVs3PfbYY3r44YfVtm1bHTx4UHfffXeFPeeTTz6pkSNHqnXr1srIyNBHH31kHW1JSEjQ8uXL9eOPP+rqq6/WFVdcoccff1y1atWqsOcHILnMqV8gA8BxLpdLCxYsKPVbLADgLTgiAwAAHIsgAwAAHIvLrwGUiW+eAXg7jsgAAADHIsgAAADHIsgAAADHIsgAAADHIsgAAADHIsgAAADHIsgAAADHIsgAAADHIsgAAADH+v8BrpI+SudJniEAAAAASUVORK5CYII=\n"
+          },
+          "metadata": {}
+        },
+        {
+          "output_type": "display_data",
+          "data": {
+            "text/plain": [
+              "<Figure size 640x480 with 1 Axes>"
+            ],
+            "image/png": "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EZksBhkiIiIyWQwyREREZLIYZIiIiMhkMcgQERGRyWKQISIiIpPFIENEREQmi0GGiIiITBaDjKEt6Sx1BURERGaDQcZA9igbP165fVKyOoiIiMwJg4yBRBX2f7xi7ShdIURERGaEQcZACmGJAksH1YpMJm0xREREZoJBhoiIiEwWgwwRERGZLAYZIiIiMlkMMkRERGSyGGSIiIjIZDHIEBERkclikCEiIiKTxSBDREREJotBhoiIiEyWpEFm2rRpkMlkGktQUJC6Pzc3F6NGjYKbmxscHBzQu3dvpKSkSFgxERERGRPJj8gEBwcjKSlJvezfv1/d995772Hjxo1YvXo1oqOjcfv2bfTq1UvCaomIiMiYWEpegKUlvLy8tNrT09OxePFirFixAi+//DIAYMmSJahXrx4OHTqEVq1aGbpUIiIiMjKSH5G5fPkyfHx8ULNmTQwcOBAJCQkAgOPHj6OgoAARERHqsUFBQahevTpiYmKkKpeIiIiMiKRHZEJCQrB06VLUrVsXSUlJmD59Ol588UWcPXsWycnJsLa2houLi8Z7PD09kZycXOw28/LykJeXp17PyMioqPKJiIhIYpIGmc6dO6tfN2zYECEhIfD398eqVatga2tbrm1GRUVh+vTp+iqRiIiIjJjkp5ae5OLigjp16uDKlSvw8vJCfn4+0tLSNMakpKTonFPzyMSJE5Genq5eEhMTK7hqIiIikopRBZmsrCxcvXoV3t7eaNasGaysrLBr1y51f1xcHBISEhAaGlrsNhQKBZycnDQWIiIiMk+Snlp6//330a1bN/j7++P27duYOnUqLCws0L9/fzg7O2P48OEYP348qlSpAicnJ4wZMwahoaG8YomIiIgASBxkbt68if79++PevXuoWrUqwsPDcejQIVStWhUAMHfuXMjlcvTu3Rt5eXmIjIzEwoULpSyZiIiIjIikQWblypUl9tvY2GDBggVYsGCBgSoiIiIiU2JUc2SIiIiIyoJBhoiIiEwWg4wUigqkroCIiMgsMMgYUL6iiurFwhBAqZS2GCIiIjPAIGNA5xp98nilIFu6QoiIiMwEg4wB3XNv8XhFxl1PRET0vPjblIiIiEwWgwwRERGZLAYZIiIiMlkMMkRERGSyGGSIiIjIZDHIEBERkclikCEiIiKTxSBDREREJotBhoiIiEwWgwwRERGZLAYZ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\n"
+          },
+          "metadata": {}
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "       Epoch Number   Bob Loss   Eve Loss   ABE loss\n",
+            "0                 0  63.374527  64.335762  64.395760\n",
+            "1                 0  64.284058  63.849663  65.274658\n",
+            "2                 0  63.234314  64.404999  64.259872\n",
+            "3                 0  64.026497  63.986015  65.025620\n",
+            "4                 0  64.105896  63.945152  65.102463\n",
+            "...             ...        ...        ...        ...\n",
+            "15995           499   0.000386  31.783457   0.000412\n",
+            "15996           499   0.000385  31.888016   0.000387\n",
+            "15997           499   0.000395  31.914431   0.000396\n",
+            "15998           499   0.000392  31.714470   0.000449\n",
+            "15999           499   0.000394  31.981861   0.000396\n",
+            "\n",
+            "[16000 rows x 4 columns]\n"
+          ]
+        }
+      ],
+      "source": [
+        "print(\"Bob Loss Graph\")\n",
+        "plt.plot(df[\"Epoch Number\"], df[\"Bob Loss\"], label=\"Bob Loss\")\n",
+        "plt.xlabel('Epoch Number')\n",
+        "plt.ylabel('Loss')\n",
+        "plt.title('Bob Loss Graph')\n",
+        "plt.legend()  # Add this line to display the legend\n",
+        "\n",
+        "# Show the plot\n",
+        "plt.show()\n",
+        "\n",
+        "# Print Eve Loss Graph\n",
+        "plt.plot(df[\"Epoch Number\"], df[\"Eve Loss\"], label=\"Eve Loss\")\n",
+        "plt.xlabel('Epoch Number')\n",
+        "plt.ylabel('Loss')\n",
+        "plt.title('Eve Loss Graph')\n",
+        "plt.legend()  # Add this line to display the legend\n",
+        "\n",
+        "# Print Eve Loss Graph\n",
+        "plt.plot(df[\"Epoch Number\"], df[\"ABE loss\"], label=\"ABE loss\")\n",
+        "plt.xlabel('Epoch Number')\n",
+        "plt.ylabel('Loss')\n",
+        "plt.title('ABE Loss Graph')\n",
+        "plt.legend()  # Add this line to display the legend\n",
+        "# Show the plot\n",
+        "plt.show()\n",
+        "\n",
+        "plt.show()\n",
+        "print(df)"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/",
+          "height": 34
+        },
+        "id": "NxiaAexQwjQt",
+        "outputId": "f0e383ef-1a4f-4fa1-8e07-ad2dae723194"
+      },
+      "outputs": [
+        {
+          "output_type": "display_data",
+          "data": {
+            "text/plain": [
+              "<IPython.core.display.Javascript object>"
+            ],
+            "application/javascript": [
+              "\n",
+              "    async function download(id, filename, size) {\n",
+              "      if (!google.colab.kernel.accessAllowed) {\n",
+              "        return;\n",
+              "      }\n",
+              "      const div = document.createElement('div');\n",
+              "      const label = document.createElement('label');\n",
+              "      label.textContent = `Downloading \"${filename}\": `;\n",
+              "      div.appendChild(label);\n",
+              "      const progress = document.createElement('progress');\n",
+              "      progress.max = size;\n",
+              "      div.appendChild(progress);\n",
+              "      document.body.appendChild(div);\n",
+              "\n",
+              "      const buffers = [];\n",
+              "      let downloaded = 0;\n",
+              "\n",
+              "      const channel = await google.colab.kernel.comms.open(id);\n",
+              "      // Send a message to notify the kernel that we're ready.\n",
+              "      channel.send({})\n",
+              "\n",
+              "      for await (const message of channel.messages) {\n",
+              "        // Send a message to notify the kernel that we're ready.\n",
+              "        channel.send({})\n",
+              "        if (message.buffers) {\n",
+              "          for (const buffer of message.buffers) {\n",
+              "            buffers.push(buffer);\n",
+              "            downloaded += buffer.byteLength;\n",
+              "            progress.value = downloaded;\n",
+              "          }\n",
+              "        }\n",
+              "      }\n",
+              "      const blob = new Blob(buffers, {type: 'application/binary'});\n",
+              "      const a = document.createElement('a');\n",
+              "      a.href = window.URL.createObjectURL(blob);\n",
+              "      a.download = filename;\n",
+              "      div.appendChild(a);\n",
+              "      a.click();\n",
+              "      div.remove();\n",
+              "    }\n",
+              "  "
+            ]
+          },
+          "metadata": {}
+        },
+        {
+          "output_type": "display_data",
+          "data": {
+            "text/plain": [
+              "<IPython.core.display.Javascript object>"
+            ],
+            "application/javascript": [
+              "download(\"download_1a9fcd94-78dc-4e09-b09c-133cb991793b\", \"insert_name.xlsx\", 805422)"
+            ]
+          },
+          "metadata": {}
+        }
+      ],
+      "source": [
+        "df.to_excel('insert_name.xlsx')\n",
+        "from google.colab import files\n",
+        "files.download('insert_name.xlsx')"
+      ]
+    }
+  ],
+  "metadata": {
+    "colab": {
+      "provenance": [],
+      "gpuType": "T4"
+    },
+    "kernelspec": {
+      "display_name": "Python 3",
+      "name": "python3"
+    },
+    "language_info": {
+      "name": "python"
+    },
+    "accelerator": "GPU"
+  },
+  "nbformat": 4,
+  "nbformat_minor": 0
+}
