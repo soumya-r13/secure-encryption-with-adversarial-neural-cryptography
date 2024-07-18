@@ -12,8 +12,8 @@ batch_size      = 256
 sample_size     = 8192 # 4096 according to the paper
 epochs          = 500 # 850000 according to the paper
 steps_per_epoch = int(sample_size/batch_size)
-TEXT_SIZE = 128
-KEY_SIZE  = 128
+TEXT_SIZE = 64
+KEY_SIZE  = 64
 # Training parameters.
 ITERS_PER_ACTOR = 1
 EVE_MULTIPLIER = 2  # Train Eve 2x for every step of Alice/Bob
