@@ -56,8 +56,8 @@
       },
       "outputs": [],
       "source": [
-        "TEXT_SIZE = 128\n",
-        "KEY_SIZE  = 128"
+        "TEXT_SIZE = 64\n",
+        "KEY_SIZE  = 64"
       ]
     },
     {
