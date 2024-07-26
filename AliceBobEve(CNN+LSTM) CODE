@@ -1,0 +1,143 @@
+//Importing the Libraries
+import tensorflow as tf
+from tensorflow.keras import layers, models, optimizers, losses
+import numpy as np
+import matplotlib.pyplot as plt
+
+//Defining the function
+def generate_data(batch_size, seq_length):
+    messages = np.random.choice([-1, 1], size=(batch_size, seq_length, 1)).astype(np.float32)
+    keys = np.random.choice([-1, 1], size=(batch_size, seq_length, 1)).astype(np.float32)
+    return messages, keys
+
+//Parameters for Data Generation
+batch_size = 64
+seq_length = 128
+train_size = 1000
+test_size = 200
+
+//Generating training and testing data
+train_messages, train_keys = generate_data(train_size, seq_length)
+test_messages, test_keys = generate_data(test_size, seq_length)
+
+//Alice's Neural Network
+def build_encryption_net():
+    model = models.Sequential()
+    model.add(layers.Conv1D(seq_length, 3, padding='same', input_shape=(None, 2)))
+    model.add(layers.LSTM(64, return_sequences=True))
+    model.add(layers.LSTM(32, return_sequences=True))
+    model.add(layers.TimeDistributed(layers.Dense(32, activation='relu')))
+    model.add(layers.TimeDistributed(layers.Dense(1, activation='sigmoid')))
+    return model
+
+//Bob's Neural Network
+def build_decryption_net():
+    model = models.Sequential()
+    model.add(layers.Conv1D(seq_length, 3, padding='same', input_shape=(None, 2)))
+    model.add(layers.LSTM(64, return_sequences=True))
+    model.add(layers.LSTM(32, return_sequences=True))
+    model.add(layers.TimeDistributed(layers.Dense(32, activation='relu')))
+    model.add(layers.TimeDistributed(layers.Dense(1, activation='sigmoid')))
+    return model
+
+//Eve's Neural Network
+def build_cnn_lstm_adversary_net():
+    model = models.Sequential()
+    model.add(layers.Conv1D(seq_length, 3, padding='same', input_shape=(None, 1)))
+    model.add(layers.LSTM(64, return_sequences=True))
+    model.add(layers.LSTM(32, return_sequences=True))
+    model.add(layers.TimeDistributed(layers.Dense(32, activation='relu')))
+    model.add(layers.TimeDistributed(layers.Dense(1, activation='sigmoid')))
+    return model
+
+//Loss Functions
+def separation(alice_input, bob_output):
+    separation_value = tf.reduce_sum(tf.abs(tf.subtract(alice_input, bob_output)), axis=1)
+    # print("separation", separation_value.numpy())
+    return separation_value
+
+def eve_vs_random_guess(alice_input, eve_output):
+    loss = tf.square(seq_length/2 - separation(alice_input, eve_output)) / (seq_length/2) ** 2
+    # print("Eve vs random guess loss:", loss.numpy())
+    return tf.reduce_mean(loss)
+
+def combined_loss_function(alice_input, decipher_bob, eve_output):
+    loss = separation(alice_input, decipher_bob)/seq_length + eve_vs_random_guess(alice_input, eve_output)
+    # print("Combined loss function:", loss.numpy())
+    return tf.reduce_mean(loss)
+
+def attacker_loss(alice_input, eve_output):
+    loss = separation(alice_input, eve_output)
+    # print("Attacker loss:", loss.numpy())
+    return tf.reduce_mean(loss)
+
+//Instantiating and compiling the Neural Networks
+alice = build_encryption_net()
+bob = build_decryption_net()
+eve_cnn_lstm = build_cnn_lstm_adversary_net()
+
+optimizer_ab = optimizers.Adam(learning_rate=0.0008)
+optimizer_e_lstm = optimizers.Adam(learning_rate=0.0008)
+optimizer_e_cnn_lstm = optimizers.Adam(learning_rate=0.0008)
+
+//Training and Testing
+num_epochs = 500
+
+train_losses_ab_list = []
+train_losses_e_lstm_list = []
+train_losses_e_cnn_lstm_list = []
+test_losses_ab_list = []
+test_losses_e_cnn_lstm_list = []
+
+for epoch in range(num_epochs):
+    with tf.GradientTape() as tape_ab:
+        combined_input = tf.concat([train_messages, train_keys], axis=-1)
+        ciphertext = alice(combined_input)
+
+        decrypted_input = tf.concat([ciphertext, train_keys], axis=-1)
+        decrypted_messages = bob(decrypted_input)
+
+        loss_ab = combined_loss_function(train_messages, decrypted_messages, eve_cnn_lstm(ciphertext))
+
+    gradients_ab = tape_ab.gradient(loss_ab, alice.trainable_variables + bob.trainable_variables)
+    optimizer_ab.apply_gradients(zip(gradients_ab, alice.trainable_variables + bob.trainable_variables))
+
+    with tf.GradientTape() as tape_e_cnn_lstm:
+
+        guessed_messages_cnn_lstm = eve_cnn_lstm(ciphertext)
+
+        loss_e_cnn_lstm = attacker_loss(train_messages, guessed_messages_cnn_lstm)
+
+    gradients_e_cnn_lstm = tape_e_cnn_lstm.gradient(loss_e_cnn_lstm, eve_cnn_lstm.trainable_variables)
+
+    optimizer_e_cnn_lstm.apply_gradients(zip(gradients_e_cnn_lstm, eve_cnn_lstm.trainable_variables))
+
+    train_losses_ab_list.append(loss_ab.numpy())
+    train_losses_e_cnn_lstm_list.append(loss_e_cnn_lstm.numpy())
+
+    test_ciphertext = alice(tf.concat([test_messages, test_keys], axis=-1))
+    test_decrypted_messages = bob(tf.concat([test_ciphertext, test_keys], axis=-1))
+    test_guessed_messages_cnn_lstm = eve_cnn_lstm(test_ciphertext)
+
+    test_loss_ab = combined_loss_function(test_messages, test_decrypted_messages, test_guessed_messages_cnn_lstm)
+    test_loss_e_cnn_lstm = attacker_loss(test_messages, test_guessed_messages_cnn_lstm)
+
+    test_losses_ab_list.append(test_loss_ab.numpy())
+    test_losses_e_cnn_lstm_list.append(test_loss_e_cnn_lstm.numpy())
+
+    print(f"Epoch {epoch + 1}: "
+          f"Loss AB: {test_loss_ab.numpy()},   Loss Eve: {test_loss_e_cnn_lstm.numpy()}")
+
+//Plotting
+plt.figure(figsize=(9, 9))
+
+plt.subplot(2, 2, 1)
+plt.plot(test_losses_ab_list, label='Bob Loss')
+plt.plot(test_losses_e_cnn_lstm_list, label='Eve CNN+LSTM Loss')
+plt.xlabel('Epochs')
+plt.ylabel('Loss')
+plt.title('Bit-Loss Graph')
+plt.legend()
+
+plt.tight_layout()
+plt.show()
